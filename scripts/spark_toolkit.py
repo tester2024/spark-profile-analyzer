@@ -869,6 +869,8 @@ def cmd_info(args):
 
     if sstats and not result.get("jvm_flags"):
         jvm_flags = sstats.get("jvm_flags", "")
+        if not jvm_flags:
+            jvm_flags = sstats.get("java", {}).get("flags", "")
         if jvm_flags:
             result["jvm_flags"] = jvm_flags
 
@@ -1676,6 +1678,565 @@ def cmd_report(args):
     return report
 
 
+def _detect_gc_type(gc_names):
+    gc_types = set()
+    for name in gc_names:
+        n = name.lower()
+        if "zgc" in n:
+            gc_types.add("ZGC")
+        elif "g1" in n:
+            gc_types.add("G1GC")
+        elif "cms" in n:
+            gc_types.add("CMS")
+        elif "parallel" in n or "ps" in n:
+            gc_types.add("Parallel")
+    return gc_types
+
+
+def _get_gc_role(name):
+    n = name.lower()
+    if "pause" in n:
+        return "STW_PAUSE"
+    if "cycle" in n or "old" in n or "major" in n:
+        return "CONCURRENT_CYCLE"
+    if "young" in n or "minor" in n:
+        return "YOUNG_GEN"
+    return "UNKNOWN"
+
+
+def cmd_analyze_gc(args):
+    data, src = load_data(args.source)
+    if not data:
+        return {"error": "Could not load data from source"}
+
+    meta = get_metadata(data)
+    pstats = get_platform_stats(meta)
+    sstats = get_system_stats(meta)
+    jvm_flags = meta.get("serverConfigurations", meta.get("server_configurations", {}))
+
+    result = {"gc_collectors": {}, "analysis": {}, "recommendations": []}
+
+    all_gc = {}
+    for stats_key, stats in [("platform", pstats), ("system", sstats)]:
+        gc_map = stats.get("gc", {})
+        for name, gc in gc_map.items():
+            key = f"{stats_key}:{name}"
+            freq = gc.get("avg_frequency", gc.get("avgFrequency", 0))
+            avg_t = gc.get("avg_time", gc.get("avgTime", 0))
+            total = gc.get("total", 0)
+            role = _get_gc_role(name)
+            is_stw = role == "STW_PAUSE"
+            is_zgc_cycle = "zgc" in name.lower() and role == "CONCURRENT_CYCLE"
+
+            collector = {
+                "name": name,
+                "source": stats_key,
+                "role": role,
+                "is_stw": is_stw,
+                "total_collections": total,
+                "avg_time_ms": avg_t,
+                "avg_frequency_per_min": freq,
+            }
+
+            if is_stw or not is_zgc_cycle:
+                if freq > 5:
+                    collector["frequency_status"] = "CRITICAL"
+                elif freq > 1:
+                    collector["frequency_status"] = "WARNING"
+                else:
+                    collector["frequency_status"] = "GOOD"
+            else:
+                if freq > 1:
+                    collector["frequency_status"] = "WARNING"
+                else:
+                    collector["frequency_status"] = "GOOD"
+
+            if is_stw:
+                if avg_t > 200:
+                    collector["pause_status"] = "CRITICAL"
+                elif avg_t > 50:
+                    collector["pause_status"] = "WARNING"
+                else:
+                    collector["pause_status"] = "GOOD"
+            elif is_zgc_cycle:
+                collector["pause_status"] = "N/A_CONCURRENT"
+            else:
+                if avg_t > 500:
+                    collector["pause_status"] = "CRITICAL"
+                elif avg_t > 100:
+                    collector["pause_status"] = "WARNING"
+                else:
+                    collector["pause_status"] = "GOOD"
+
+            all_gc[key] = collector
+
+    result["gc_collectors"] = all_gc
+
+    gc_types = _detect_gc_type([n for n in all_gc])
+    result["analysis"]["detected_gc_type"] = list(gc_types) if gc_types else ["Unknown"]
+
+    heap_info = pstats.get("memory", {}).get("heap", {})
+    heap_max = heap_info.get("max", 0)
+    heap_used = heap_info.get("used", 0)
+
+    if heap_max > 0:
+        heap_pct = round(heap_used / heap_max * 100, 1)
+        result["analysis"]["heap_usage_pct"] = heap_pct
+        if heap_pct > 90:
+            result["analysis"]["heap_pressure"] = "CRITICAL"
+        elif heap_pct > 75:
+            result["analysis"]["heap_pressure"] = "WARNING"
+        else:
+            result["analysis"]["heap_pressure"] = "GOOD"
+
+    flags_str = str(jvm_flags)
+    result["analysis"]["jvm_flags"] = flags_str if flags_str else "Not available from profile data"
+
+    if "ZGC" in gc_types:
+        stw_pauses = [c for c in all_gc.values() if "zgc" in c["name"].lower() and c["is_stw"]]
+        concurrent_cycles = [c for c in all_gc.values() if "zgc" in c["name"].lower() and c["role"] == "CONCURRENT_CYCLE"]
+        if stw_pauses:
+            max_pause_freq = max(c["avg_frequency_per_min"] for c in stw_pauses)
+            max_pause_time = max(c["avg_time_ms"] for c in stw_pauses)
+            result["analysis"]["zgc_stw_pause_max_freq"] = max_pause_freq
+            result["analysis"]["zgc_stw_pause_max_time_ms"] = max_pause_time
+            if max_pause_time > 1:
+                result["recommendations"].append({
+                    "severity": "WARNING",
+                    "detail": f"ZGC STW pauses averaging {max_pause_time:.2f}ms should be sub-millisecond. Check -XX:ZCollectionInterval and heap sizing.",
+                })
+            if max_pause_freq > 10:
+                result["recommendations"].append({
+                    "severity": "CRITICAL",
+                    "detail": f"ZGC minor pauses at {max_pause_freq:.1f}/min is very high, indicating high allocation rate or insufficient heap. Consider increasing heap or reducing allocation.",
+                })
+        if concurrent_cycles:
+            for c in concurrent_cycles:
+                result["recommendations"].append({
+                    "severity": "INFO",
+                    "detail": f"ZGC '{c['name']}' avg cycle time {c['avg_time_ms']:.1f}ms is CONCURRENT (not STW). This does NOT directly cause TPS loss.",
+                })
+
+    if "G1GC" in gc_types:
+        young_gc = [c for c in all_gc.values() if "g1" in c["name"].lower() and c["role"] == "YOUNG_GEN"]
+        if young_gc:
+            for c in young_gc:
+                if c["avg_time_ms"] > 200:
+                    result["recommendations"].append({
+                        "severity": "CRITICAL",
+                        "detail": f"G1 young gen pause {c['avg_time_ms']:.1f}ms exceeds 200ms target. Use Aikar's flags or increase -XX:G1NewSizePercent.",
+                    })
+
+    if not result["recommendations"]:
+        stw_issues = [c for c in all_gc.values() if c.get("pause_status") in ("CRITICAL", "WARNING") and c["is_stw"]]
+        freq_issues = [c for c in all_gc.values() if c.get("frequency_status") in ("CRITICAL", "WARNING")]
+        if not stw_issues and not freq_issues:
+            result["recommendations"].append({"severity": "INFO", "detail": "GC health appears good. No immediate tuning required."})
+
+    return result
+
+
+def cmd_analyze_tps(args):
+    data, src = load_data(args.source)
+    if not data:
+        return {"error": "Could not load data from source"}
+
+    meta = get_metadata(data)
+    pstats = get_platform_stats(meta)
+    window_stats = get_window_stats(data)
+
+    result = {"overall": {}, "windows_analysis": [], "lag_spikes": [], "recommendations": []}
+
+    tps_data = pstats.get("tps", {})
+    mspt_data = pstats.get("mspt", {})
+
+    if tps_data:
+        for period, key in [("1m", "last1m"), ("5m", "last5m"), ("15m", "last15m")]:
+            val = tps_data.get(key, 0)
+            result["overall"][f"tps_{period}"] = {"value": val, "status": assess_tps(val)}
+
+    if mspt_data:
+        for period, key in [("1m", "last1m"), ("5m", "last5m")]:
+            w = mspt_data.get(key, {})
+            if w:
+                med = w.get("median", 0)
+                p95 = w.get("percentile95", 0)
+                mx = w.get("max", 0)
+                result["overall"][f"mspt_{period}"] = {
+                    "median": med, "p95": p95, "max": mx,
+                    "median_status": assess_mspt(med),
+                    "p95_status": assess_mspt(p95),
+                    "max_status": assess_mspt(mx),
+                }
+                if mx > 0 and med > 0:
+                    spike_ratio = round(mx / med, 1) if med > 0 else 0
+                    if spike_ratio > 3:
+                        result["lag_spikes"].append({
+                            "period": period,
+                            "median_ms": med,
+                            "max_ms": mx,
+                            "spike_ratio": spike_ratio,
+                            "severity": "CRITICAL" if spike_ratio > 5 else "WARNING",
+                            "detail": f"MSPT max ({mx}ms) is {spike_ratio}x the median ({med}ms), indicating severe lag spikes",
+                        })
+
+    if window_stats:
+        sorted_windows = sorted(window_stats.items(), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 0)
+        tps_values = []
+        entity_values = []
+        player_values = []
+
+        for wid, ws in sorted_windows:
+            t = ws.get("tps", 0)
+            e = ws.get("entities", 0)
+            p = ws.get("players", 0)
+            mspt_med = ws.get("mspt_median", 0)
+            mspt_mx = ws.get("mspt_max", 0)
+            tps_values.append(t)
+            entity_values.append(e)
+            player_values.append(p)
+
+            w_analysis = {
+                "window_id": wid,
+                "tps": t, "tps_status": assess_tps(t),
+                "mspt_median": mspt_med, "mspt_max": mspt_mx,
+                "players": p, "entities": e,
+                "duration": ws.get("duration"),
+            }
+            if t < 19:
+                w_analysis["lag_detected"] = True
+                w_analysis["severity"] = "CRITICAL" if t < 15 else "WARNING"
+
+            result["windows_analysis"].append(w_analysis)
+
+        if len(tps_values) > 2:
+            min_tps = min(tps_values)
+            max_tps = max(tps_values)
+            tps_variability = round(max_tps - min_tps, 2)
+            result["analysis"] = {
+                "tps_range": f"{min_tps:.2f} - {max_tps:.2f}",
+                "tps_variability": tps_variability,
+                "avg_entities": round(sum(entity_values) / len(entity_values)),
+                "avg_players": round(sum(player_values) / len(player_values)),
+            }
+
+            low_tps_windows = [w for w in result["windows_analysis"] if w.get("tps", 20) < 19]
+            if low_tps_windows:
+                result["recommendations"].append({
+                    "severity": "WARNING",
+                    "detail": f"{len(low_tps_windows)} of {len(result['windows_analysis'])} time windows had TPS < 19. Check entity counts and player load during those windows.",
+                })
+
+            if tps_variability > 1:
+                result["recommendations"].append({
+                    "severity": "INFO",
+                    "detail": f"TPS variability is {tps_variability:.2f}. High variability suggests intermittent load spikes rather than sustained overload.",
+                })
+
+    if not result["recommendations"]:
+        result["recommendations"].append({"severity": "INFO", "detail": "TPS appears stable and healthy across all windows."})
+
+    return result
+
+
+def cmd_analyze_cpu(args):
+    data, src = load_data(args.source)
+    if not data:
+        return {"error": "Could not load data from source"}
+
+    meta = get_metadata(data)
+    pstats = get_platform_stats(meta)
+    sstats = get_system_stats(meta)
+
+    result = {"cpu_analysis": {}, "recommendations": []}
+
+    cpu = sstats.get("cpu", {})
+    if cpu:
+        proc_1m = cpu.get("processUsage", cpu.get("process_usage", {})).get("last1m", 0)
+        sys_1m = cpu.get("systemUsage", cpu.get("system_usage", {})).get("last1m", 0)
+        model = cpu.get("modelName", cpu.get("model_name", "unknown"))
+        threads = cpu.get("threads", 0)
+
+        result["cpu_analysis"] = {
+            "model": model,
+            "threads": threads,
+            "process_usage_1m": round(proc_1m * 100, 1),
+            "system_usage_1m": round(sys_1m * 100, 1),
+        }
+
+        if proc_1m > 0.8:
+            result["cpu_analysis"]["process_status"] = "CRITICAL"
+            result["recommendations"].append({
+                "severity": "CRITICAL",
+                "detail": f"Server process using {proc_1m*100:.1f}% CPU. Server is CPU-bound. Reduce view-distance, entity counts, or optimize plugins.",
+            })
+        elif proc_1m > 0.5:
+            result["cpu_analysis"]["process_status"] = "WARNING"
+            result["recommendations"].append({
+                "severity": "WARNING",
+                "detail": f"Server process using {proc_1m*100:.1f}% CPU. Getting close to limits. Monitor for spikes.",
+            })
+        else:
+            result["cpu_analysis"]["process_status"] = "GOOD"
+
+        if sys_1m > 0.9:
+            result["cpu_analysis"]["system_status"] = "CRITICAL"
+            result["recommendations"].append({
+                "severity": "CRITICAL",
+                "detail": f"Total system CPU at {sys_1m*100:.1f}%. Other processes on host consuming resources. Consider dedicated hosting.",
+            })
+        elif sys_1m > 0.7:
+            result["cpu_analysis"]["system_status"] = "WARNING"
+        else:
+            result["cpu_analysis"]["system_status"] = "GOOD"
+
+        if proc_1m > 0.3 and sys_1m > 0.9:
+            other_pct = round((sys_1m - proc_1m) * 100, 1)
+            result["recommendations"].append({
+                "severity": "WARNING",
+                "detail": f"Other processes using ~{other_pct}% CPU. Host has competing workloads. Check for background tasks, backups, or other servers.",
+            })
+
+    threads = get_threads(data)
+    if threads:
+        total_thread_time = sum(sum(t.get("times", [])) for t in threads)
+        top_threads = sorted(threads, key=lambda t: -sum(t.get("times", [])))
+        result["thread_cpu"] = []
+        for t in top_threads[:10]:
+            total = sum(t.get("times", []))
+            result["thread_cpu"].append({
+                "name": t.get("name"),
+                "total_time": total,
+                "pct_of_total": pct(total, total_thread_time),
+            })
+
+    if not result["recommendations"]:
+        result["recommendations"].append({"severity": "INFO", "detail": "CPU usage appears healthy."})
+
+    return result
+
+
+def cmd_recommend(args):
+    data, src = load_data(args.source)
+    if not data:
+        return {"error": "Could not load data from source"}
+
+    meta = get_metadata(data)
+    pstats = get_platform_stats(meta)
+    sstats = get_system_stats(meta)
+    threads = get_threads(data)
+    platform = get_platform_meta(meta)
+
+    result = {
+        "platform": platform,
+        "recommendations": [],
+        "priority_actions": [],
+    }
+
+    gc_types = set()
+    all_gc = {}
+    for stats_key, stats in [("platform", pstats), ("system", sstats)]:
+        for name, gc in stats.get("gc", {}).items():
+            freq = gc.get("avg_frequency", gc.get("avgFrequency", 0))
+            avg_t = gc.get("avg_time", gc.get("avgTime", 0))
+            all_gc[f"{stats_key}:{name}"] = {"freq": freq, "avg_time": avg_t, "name": name}
+            if "zgc" in name.lower():
+                gc_types.add("ZGC")
+            elif "g1" in name.lower():
+                gc_types.add("G1GC")
+
+    tps_data = pstats.get("tps", {})
+    if tps_data:
+        for key in ["last1m", "last5m", "last15m"]:
+            val = tps_data.get(key, 20)
+            if val < 15:
+                result["recommendations"].append({"severity": "CRITICAL", "category": "tps", "detail": f"TPS {key} at {val:.1f} is critically low. Immediate action required.", "action": "Reduce entity counts, view-distance, or find lag-causing plugin via 'hotspots --thread server --exclude-sleep'"})
+            elif val < 19.5:
+                result["recommendations"].append({"severity": "WARNING", "category": "tps", "detail": f"TPS {key} at {val:.1f} is below ideal 20.", "action": "Run 'hotspots' and 'plugins' commands to identify what is consuming time."})
+
+    heap_info = pstats.get("memory", {}).get("heap", {})
+    if heap_info:
+        used = heap_info.get("used", 0)
+        mx = heap_info.get("max", 0)
+        if mx > 0 and used > 0:
+            heap_pct = used / mx * 100
+            if heap_pct > 85:
+                result["recommendations"].append({"severity": "CRITICAL", "category": "memory", "detail": f"Heap at {heap_pct:.1f}% ({format_bytes(used)}/{format_bytes(mx)}). Risk of OOM and GC thrashing.", "action": f"Increase -Xmx to at least {format_bytes(int(used * 1.3))}, or reduce memory usage."})
+            elif heap_pct > 70:
+                result["recommendations"].append({"severity": "WARNING", "category": "memory", "detail": f"Heap at {heap_pct:.1f}%. Getting high.", "action": "Monitor for growth trend. Consider increasing heap or reducing allocation rate."})
+
+    if threads:
+        server_threads = [t for t in threads if "server" in t.get("name", "").lower() or "region" in t.get("name", "").lower()]
+        for t in server_threads:
+            total = sum(t.get("times", []))
+            if total == 0:
+                continue
+            children = t.get("children", [])
+            sleep_time = 0
+            sleep_names = {"waitForNextTick", "Thread.sleep", "LockSupport.park", "Object.wait", "Unsafe.park"}
+            for c in children:
+                if any(s in c.get("methodName", c.get("method_name", "")) for s in sleep_names):
+                    sleep_time += sum(c.get("times", []))
+            sleep_pct = pct(sleep_time, total)
+            if sleep_pct < 5:
+                result["recommendations"].append({"severity": "CRITICAL", "category": "overload", "detail": f"Thread '{t['name']}' has only {sleep_pct}% sleep time. Severely overloaded.", "action": "Reduce tick workload: entities, chunks, plugin tasks. Consider Folia for regional parallelism."})
+            elif sleep_pct < 20:
+                result["recommendations"].append({"severity": "WARNING", "category": "overload", "detail": f"Thread '{t['name']}' has {sleep_pct}% sleep time. Working very hard.", "action": "Identify hotspots with 'hotspots --exclude-sleep' and attribute with 'plugins'."})
+
+    if gc_types:
+        stw_pauses = {k: v for k, v in all_gc.items() if "pause" in k.lower() and v["avg_time"] > 0}
+        for key, gc in stw_pauses.items():
+            if gc["avg_time"] > 200:
+                result["recommendations"].append({"severity": "CRITICAL", "category": "gc", "detail": f"GC '{gc['name']}' STW pause avg {gc['avg_time']:.1f}ms causes noticeable lag.", "action": "Tune GC flags. For G1GC use Aikar's flags. For ZGC ensure -XX:+UnlockExperimentalVMOptions is set."})
+            if gc["freq"] > 5:
+                result["recommendations"].append({"severity": "CRITICAL", "category": "gc", "detail": f"GC '{gc['name']}' frequency {gc['freq']:.1f}/min is very high.", "action": "Increase heap size or reduce allocation rate. High frequency = lots of short-lived objects."})
+
+    if "ZGC" in gc_types:
+        result["recommendations"].append({"severity": "INFO", "category": "gc", "detail": "ZGC detected. ZGC cycles are CONCURRENT and do NOT cause STW pauses. Only 'Pauses' matter for TPS impact.", "action": "Focus on ZGC Minor/Major Pauses, not Cycles, when assessing lag impact."})
+
+    world_stats = pstats.get("world", pstats.get("WorldStatistics", {}))
+    if world_stats:
+        total_ents = world_stats.get("totalEntities", world_stats.get("total_entities", 0))
+        entity_counts = world_stats.get("entityCounts", world_stats.get("entity_counts", {}))
+        if total_ents > 5000:
+            result["recommendations"].append({"severity": "WARNING", "category": "entities", "detail": f"{total_ents} entities across all worlds. High entity counts cause tick lag.", "action": "Reduce view-distance, use stack plugins, limit mob spawning areas, check entity_counts for top types."})
+        top_entities = sorted(entity_counts.items(), key=lambda x: -x[1])[:3] if entity_counts else []
+        for name, count in top_entities:
+            if count > 500:
+                result["recommendations"].append({"severity": "WARNING", "category": "entities", "detail": f"{count} '{name}' entities detected.", "action": f"Consider reducing {name} count or optimizing farms/spawners producing them."})
+
+    result["priority_actions"] = sorted(
+        result["recommendations"],
+        key=lambda r: {"CRITICAL": 0, "WARNING": 1, "INFO": 2}.get(r.get("severity", "INFO"), 3)
+    )
+
+    return result
+
+
+def cmd_check_config(args):
+    data, src = load_data(args.source)
+    if not data:
+        return {"error": "Could not load data from source"}
+
+    meta = get_metadata(data)
+    platform = get_platform_meta(meta)
+    configs = meta.get("serverConfigurations", meta.get("server_configurations", {}))
+    jvm_flags_str = configs.get("jvm_args", configs.get("flags", ""))
+
+    sstats = get_system_stats(meta)
+    java_info = sstats.get("java", {})
+    if not jvm_flags_str and java_info.get("flags"):
+        jvm_flags_str = java_info["flags"]
+    if not jvm_flags_str and java_info.get("runtimeName"):
+        pass
+    if not jvm_flags_str:
+        jvm_flags_str = sstats.get("jvm_flags", "")
+
+    server_name = platform.get("name", "").lower()
+    result = {
+        "platform": platform,
+        "jvm_analysis": {},
+        "config_analysis": {},
+        "recommendations": [],
+    }
+
+    if not jvm_flags_str:
+        result["jvm_analysis"] = {"status": "NO_DATA", "detail": "JVM flags not found in profile. Use /spark profiler start --comment \"flags\" or check startup script."}
+        return result
+
+    flags = jvm_flags_str if isinstance(jvm_flags_str, list) else jvm_flags_str.split()
+    flags_str = " ".join(flags) if isinstance(flags, list) else jvm_flags_str
+
+    def has_flag(pattern):
+        return bool(re.search(pattern, flags_str, re.IGNORECASE))
+
+    result["jvm_analysis"]["raw_flags"] = flags_str
+
+    xmx_match = re.search(r"-Xmx(\d+)([gGmMkK]?)", flags_str)
+    xms_match = re.search(r"-Xms(\d+)([gGmMkK]?)", flags_str)
+    if xmx_match:
+        xmx_val = int(xmx_match.group(1))
+        xmx_unit = xmx_match.group(2).upper() or "M"
+        result["jvm_analysis"]["heap_max"] = f"{xmx_val}{xmx_unit}"
+    if xms_match:
+        xms_val = int(xms_match.group(1))
+        xms_unit = xms_match.group(2).upper() or "M"
+        result["jvm_analysis"]["heap_init"] = f"{xms_val}{xms_unit}"
+    if xmx_match and xms_match:
+        if xms_val != xmx_val or xms_match.group(2).upper() != xmx_match.group(2).upper():
+            result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "-Xms and -Xmx should be equal to prevent heap fragmentation.", "action": f"Set both to -Xms{xmx_val}{xmx_unit} -Xmx{xmx_val}{xmx_unit}"})
+
+    gc_detected = None
+    if has_flag(r"UseZGC|ZGarbageCollector"):
+        gc_detected = "ZGC"
+    elif has_flag(r"UseG1GC"):
+        gc_detected = "G1GC"
+    elif has_flag(r"UseParallelGC|UseParallelOldGC"):
+        gc_detected = "Parallel"
+    elif has_flag(r"UseConcMarkSweepGC|UseCMS"):
+        gc_detected = "CMS"
+    result["jvm_analysis"]["detected_gc"] = gc_detected
+
+    if gc_detected == "Parallel":
+        result["recommendations"].append({"severity": "CRITICAL", "category": "gc", "detail": "Parallel GC causes STW pauses. Switch to G1GC (Aikar's flags) for Minecraft.", "action": "Use G1GC or ZGC instead. See jvm-gc-tuning.md reference."})
+    elif gc_detected == "CMS":
+        result["recommendations"].append({"severity": "CRITICAL", "category": "gc", "detail": "CMS GC is deprecated and unsuitable for Minecraft. Switch to G1GC or ZGC.", "action": "Use G1GC with Aikar's flags or ZGC for large heaps (>30GB)."})
+
+    if gc_detected == "G1GC":
+        aikar_flags = {
+            "G1NewSizePercent": "40",
+            "G1ReservePercent": "20",
+            "MaxGCPauseMillis": "200",
+            "G1HeapRegionSize": None,
+            "MaxTenuringThreshold": "1",
+            "SurvivorRatio": "32",
+            "G1MixedGCCountTarget": "4",
+            "G1MixedGCLiveThresholdPercent": "90",
+            "G1RSetUpdatingPauseTimePercent": "5",
+        }
+        missing = []
+        for flag, expected in aikar_flags.items():
+            if not has_flag(flag):
+                missing.append(flag)
+        if missing:
+            result["recommendations"].append({"severity": "WARNING", "category": "gc_tuning", "detail": f"Missing Aikar's G1GC flags: {', '.join(missing)}", "action": "Add these flags for optimal G1GC performance. See jvm-gc-tuning.md reference."})
+
+        if xmx_match:
+            heap_gb = xmx_val if xmx_match.group(2).upper() == "G" else xmx_val / 1024
+            if heap_gb >= 12 and not has_flag(r"G1HeapRegionSize"):
+                result["recommendations"].append({"severity": "CRITICAL", "category": "gc_tuning", "detail": f"Missing -XX:G1HeapRegionSize for {heap_gb}GB heap. Critical for preventing humongous objects.", "action": f"Set -XX:G1HeapRegionSize={8 if heap_gb < 32 else 16}M"})
+
+    if gc_detected == "ZGC":
+        zgc_flags = ["ZUncommit", "AlwaysPreTouch", "ParallelRefProcEnabled", "UseLargePages"]
+        for flag in zgc_flags:
+            neg_flag = f"-XX:-{flag}"
+            pos_flag = f"-XX:+{flag}"
+            if pos_flag in flags_str:
+                pass
+            elif neg_flag in flags_str and flag == "ZUncommit":
+                result["recommendations"].append({"severity": "INFO", "category": "zgc", "detail": "ZUncommit is disabled, which is recommended for Minecraft.", "action": "Keep -XX:-ZUncommit to prevent heap shrinking."})
+        if not has_flag(r"AlwaysPreTouch"):
+            result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "Missing -XX:+AlwaysPreTouch. Pre-touching heap pages improves startup consistency.", "action": "Add -XX:+AlwaysPreTouch"})
+        if not has_flag(r"ParallelRefProcEnabled"):
+            result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "Consider -XX:+ParallelRefProcEnabled for parallel reference processing.", "action": "Add -XX:+ParallelRefProcEnabled"})
+
+    if not has_flag(r"DisableExplicitGC"):
+        result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "Missing -XX:+DisableExplicitGC. Plugins can trigger full GC causing lag spikes.", "action": "Add -XX:+DisableExplicitGC unless you specifically need System.gc() calls."})
+
+    if has_flag(r"UseStringDeduplication") and gc_detected == "ZGC":
+        result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "String deduplication enabled with ZGC - this reduces memory for duplicate strings.", "action": "Keep this flag for memory optimization."})
+
+    if has_flag(r"UseNUMA"):
+        result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "NUMA awareness enabled. Good for multi-socket systems.", "action": "Keep -XX:+UseNUMA if on multi-socket hardware."})
+
+    if not has_flag(r"MaxInlineLevel") and "velocity" in server_name:
+        result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "For Velocity proxy, consider -XX:MaxInlineLevel=15 for better JIT optimization.", "action": "Add -XX:MaxInlineLevel=15 to startup flags."})
+
+    result["config_analysis"] = {k: v for k, v in configs.items() if k not in ("jvm_args", "flags") and v}
+
+    return result
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="spark_toolkit",
@@ -1767,6 +2328,22 @@ def build_parser():
     # report
     sub.add_parser("report", parents=[common], help="Generate full analysis report with findings")
 
+    # analyze-gc
+    sub.add_parser("analyze-gc", parents=[common], help="Deep GC analysis with ZGC/G1GC-specific insights and tuning recommendations")
+
+    # analyze-tps
+    sub.add_parser("analyze-tps", parents=[common], help="TPS/MSPT analysis with lag spike detection and window correlation")
+
+    # analyze-cpu
+    sub.add_parser("analyze-cpu", parents=[common], help="CPU usage analysis with process/system breakdown and thread attribution")
+
+    # recommend
+    sub.add_parser("recommend", parents=[common], help="Comprehensive performance recommendations with priority actions")
+
+    # check-config
+    p_check = sub.add_parser("check-config", parents=[common], help="Analyze JVM flags and server configuration for performance issues")
+    p_check.add_argument("--platform", choices=["paper", "folia", "spigot", "bukkit", "velocity", "bungee"], help="Server platform for config-specific checks")
+
     return parser
 
 
@@ -1794,6 +2371,11 @@ def main():
         "callpath": cmd_callpath,
         "compare": cmd_compare,
         "report": cmd_report,
+        "analyze-gc": cmd_analyze_gc,
+        "analyze-tps": cmd_analyze_tps,
+        "analyze-cpu": cmd_analyze_cpu,
+        "recommend": cmd_recommend,
+        "check-config": cmd_check_config,
     }
 
     handler = commands.get(args.command)
