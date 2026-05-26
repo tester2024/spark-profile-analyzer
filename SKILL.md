@@ -20,6 +20,11 @@ Analyze Lucko Spark profiler data for Minecraft servers using `scripts/spark_too
 | Provides heap summary data | "heap summary shows...", "/spark heapsummary" |
 | Mentions entity lag | "too many entities", "entity lag" |
 | Mentions allocation issues | "high allocation", "memory leak" |
+| Wants config review/recommendations | "review my server config", "optimize my setup", "what should I change" |
+| Mentions gamemode-specific optimization | "optimize for Bedwars", "best config for SMP", "lobby server setup" |
+| Shares server config files | "here's my server.properties", "review my spigot.yml" |
+| Asks about specific config settings | "what should hopper-transfer be", "is merge-radius safe" |
+| Mentions config bugs/issues | "items disappearing", "mobs not spawning", "farms broken after config change" |
 
 ## Supported Input Formats
 
@@ -75,6 +80,19 @@ python spark_toolkit.py report https://spark.lucko.me/abc123
 
 ### Heap/Memory Analysis
 1. `heap` -> `heap --plugin <name>` -> cross-ref with `gc` and `plugins` -> `entities` -> identify leaks/bloat
+
+### Server Config Review (Gamemode-Aware)
+1. `info` -> identify platform, version, plugins (gamemode type) -> ask user for config files or extract from analysis -> identify server type (SMP / Lobby / Bedwars / Skyblock / Factions / Creative / Modded) -> cross-reference spark findings with config -> generate gamemode-specific recommendations with safety checks -> WARN about bug-configs and dependency issues -> present with risk labels
+
+**CRITICAL**: When reviewing configs, you MUST:
+- Determine the server gamemode BEFORE recommending any config changes
+- Never recommend settings that break core gameplay for that gamemode
+- Always warn about bug-configs (settings that improve performance but introduce bugs)
+- Check config dependencies (e.g., spawn-limits + mob-spawn-range must be adjusted together)
+- Label every recommendation with a risk level ([SAFE] / [LOW RISK] / [MODERATE RISK] / [HIGH RISK] / [BRAKE WARNING] / [NEVER])
+- Flag settings that should NEVER be changed (hopper-transfer=8, max-entity-collisions>=3, simulation-distance>=4 for gameplay worlds)
+
+See `references/server-config-review.md` for the complete gamemode-specific configuration guide, bug-config warnings, safety rules, and review checklist.
 
 ---
 
@@ -443,6 +461,32 @@ python spark_toolkit.py report https://spark.lucko.me/abc123
 - When choosing between Velocity and BungeeCord for a new setup
 - When the user has a load balancer in front of the proxy and needs configuration guidance
 - When auditing for common proxy misconfigurations (missing forwarding secret, backends with online-mode=true)
+
+---
+
+### `references/server-config-review.md` -- Gamemode-Aware Config Review & Bug-Config Warnings
+
+**What it is:** Comprehensive guide for reviewing Minecraft server configurations with gamemode-specific profiles, bug-config warnings, safety rules, and a systematic review checklist. Covers SMP, Lobby, Bedwars, Skywars, Factions, Skyblock, Creative, and Modded server types.
+
+**Why use it:** After spark analysis identifies *what* is causing lag, you need to recommend config changes, but those changes depend entirely on the server's gamemode. A setting that's perfectly fine for a lobby is game-breaking for SMP. This reference prevents you from making recommendations that damage gameplay:
+
+- **Gamemode-specific configuration profiles** -- SMP (preserve vanilla), Lobby (aggressive optimization OK), Bedwars/Skywars (combat mechanics matter), Skyblock (farms and hoppers are critical), Factions/PvP (visibility and combat fairness), Creative (maximize view distance, minimize entities), Modded (research mod requirements first)
+- **Bug-config warnings** -- 10 specific configs that improve performance numbers but introduce bugs: hopper-transfer=1 (server-destroying), max-entity-collisions<3 (game-breaking), simulation-distance<4 (farms broken), excessive merge-radius (items teleport), tick-inactive-villagers:false (iron farms broken), and more
+- **Absolute never-change rules** -- hopper-transfer must be 8, max-entity-collisions >= 3, simulation-distance >= 4 for gameplay worlds, mob-spawn-range <= sim-dist-1 AND >= 3
+- **Conditional never-change rules** -- gamemode-dependent settings that should NOT be changed (don't disable doMobSpawning on SMP, don't lower entity-tracking-range.players on PvP, etc.)
+- **Config dependency matrix** -- which configs MUST be changed together (spawn-limits + mob-spawn-range, simulation-distance + despawn-ranges, activation-range + tracking-range)
+- **Risk labels** -- [SAFE], [LOW RISK], [MODERATE RISK], [HIGH RISK], [BRAKE WARNING], [NEVER], [DEPENDS]
+- **Systematic review checklist** -- 12-point checklist template covering view/sim distance, entity ranges, spawn limits, merge radius, despawn ranges, hopper settings, entity limits, gamerules, JVM flags, per-world configs, bug-config check, and dependency validation
+- **Quick-reference gamemode decision matrix** -- every major config value for every gamemode type at a glance
+
+**When to look at it:**
+- When the user asks for config review or optimization recommendations
+- When spark analysis reveals entity lag and you need to recommend spawn-limit/activation-range changes
+- When the user mentions their server gamemode (SMP, Bedwars, etc.) and needs tailored configs
+- When recommending any config change -- ALWAYS check the bug-config warnings first
+- When the user shares their config files for review
+- When the user reports bugs after config changes (items disappearing, mobs not spawning, farms broken)
+- When you see a dangerous config like `hopper-transfer: 1` or `max-entity-collisions: 2` in a user's config
 
 ---
 
