@@ -45,8 +45,407 @@ import urllib.error
 from collections import defaultdict
 from pathlib import Path
 
+_PROTO_LOADED = False
+spark_pb2 = None
+
+
+def _ensure_proto():
+    global _PROTO_LOADED, spark_pb2
+    if _PROTO_LOADED:
+        return spark_pb2 is not None
+    _PROTO_LOADED = True
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        proto_dir = os.path.join(os.path.dirname(script_dir), "proto")
+        if proto_dir not in sys.path:
+            sys.path.insert(0, proto_dir)
+        import spark_pb2 as _spark_pb2
+        spark_pb2 = _spark_pb2
+        return True
+    except Exception:
+        spark_pb2 = None
+        return False
+
 SPARK_VIEWER_BASE = "https://spark.lucko.me"
 SPARK_RAW_BASE = "https://spark-usercontent.lucko.me"
+
+PROTO_TYPE_MAP = {0: "SERVER", 1: "CLIENT", 2: "PROXY", 3: "APPLICATION"}
+SAMPLER_MODE_MAP = {0: "EXECUTION", 1: "ALLOCATION"}
+SAMPLER_ENGINE_MAP = {0: "JAVA", 1: "ASYNC"}
+AGGREGATOR_TYPE_MAP = {0: "SIMPLE", 1: "TICKED"}
+THREAD_GROUPER_MAP = {0: "BY_NAME", 1: "BY_POOL", 2: "AS_ONE"}
+
+
+def _proto_node_to_dict(node, flat_children, visited=None):
+    if visited is None:
+        visited = set()
+    node_id = id(node)
+    if node_id in visited:
+        return {"className": node.class_name, "methodName": node.method_name, "times": list(node.times), "children": []}
+    visited.add(node_id)
+
+    d = {
+        "className": node.class_name,
+        "methodName": node.method_name,
+        "times": list(node.times),
+    }
+    if node.line_number:
+        d["lineNumber"] = node.line_number
+    if node.method_desc:
+        d["methodDesc"] = node.method_desc
+
+    children = []
+    for ref in node.children_refs:
+        if 0 <= ref < len(flat_children):
+            child_node = flat_children[ref]
+            children.append(_proto_node_to_dict(child_node, flat_children, visited))
+    d["children"] = children
+    return d
+
+
+def _proto_thread_to_dict(thread_node):
+    flat_children = list(thread_node.children)
+    if thread_node.children_refs:
+        root_indices = list(thread_node.children_refs)
+    else:
+        root_indices = list(range(len(flat_children)))
+
+    visited = set()
+    root_children = []
+    for idx in root_indices:
+        if 0 <= idx < len(flat_children):
+            root_children.append(_proto_node_to_dict(flat_children[idx], flat_children, visited))
+
+    return {
+        "name": thread_node.name,
+        "times": list(thread_node.times),
+        "children": root_children,
+    }
+
+
+def _proto_gc_to_dict(gc_msg):
+    freq_ms = gc_msg.avg_frequency
+    freq_per_min = round(60000.0 / freq_ms, 2) if freq_ms > 0 else 0
+    return {
+        "total": gc_msg.total,
+        "avgTime": gc_msg.avg_time,
+        "avgFrequency": freq_per_min,
+    }
+
+
+def _proto_rolling_avg_to_dict(ra):
+    if not ra.mean and not ra.max and not ra.median:
+        return {}
+    return {
+        "mean": ra.mean,
+        "max": ra.max,
+        "min": ra.min,
+        "median": ra.median,
+        "percentile95": ra.percentile95,
+    }
+
+
+def _proto_memory_usage_to_dict(mu):
+    return {
+        "used": mu.used,
+        "committed": mu.committed,
+        "max": mu.max,
+    }
+
+
+def _proto_platform_stats_to_dict(ps):
+    d = {}
+    if ps.HasField("memory"):
+        mem = {}
+        if ps.memory.HasField("heap"):
+            mem["heap"] = _proto_memory_usage_to_dict(ps.memory.heap)
+        if ps.memory.HasField("non_heap"):
+            mem["nonHeap"] = _proto_memory_usage_to_dict(ps.memory.non_heap)
+        if ps.memory.pools:
+            mem["pools"] = []
+            for pool in ps.memory.pools:
+                pool_d = {"name": pool.name}
+                if pool.HasField("before"):
+                    pool_d["before"] = _proto_memory_usage_to_dict(pool.before)
+                if pool.HasField("after"):
+                    pool_d["after"] = _proto_memory_usage_to_dict(pool.after)
+                mem["pools"].append(pool_d)
+        d["memory"] = mem
+    gc_map = {}
+    for name in ps.gc:
+        gc_map[name] = _proto_gc_to_dict(ps.gc[name])
+    if gc_map:
+        d["gc"] = gc_map
+    d["uptime"] = ps.uptime
+    if ps.HasField("tps"):
+        d["tps"] = {
+            "last1m": ps.tps.last1m,
+            "last5m": ps.tps.last5m,
+            "last15m": ps.tps.last15m,
+            "gameTargetTps": ps.tps.game_target_tps if ps.tps.game_target_tps else 20,
+        }
+    if ps.HasField("mspt"):
+        mspt_d = {}
+        if ps.mspt.HasField("last1m"):
+            mspt_d["last1m"] = _proto_rolling_avg_to_dict(ps.mspt.last1m)
+        if ps.mspt.HasField("last5m"):
+            mspt_d["last5m"] = _proto_rolling_avg_to_dict(ps.mspt.last5m)
+        mspt_d["gameMaxIdealMspt"] = ps.mspt.game_max_ideal_mspt
+        d["mspt"] = mspt_d
+    if ps.HasField("ping"):
+        d["ping"] = {
+            "last1m": ps.ping.last1m,
+            "last5m": ps.ping.last5m,
+            "last15m": ps.ping.last15m,
+        }
+    d["playerCount"] = ps.player_count
+    if ps.HasField("world"):
+        w = ps.world
+        world_d = {
+            "totalEntities": w.total_entities,
+            "entityCounts": dict(w.entity_counts),
+            "worlds": [],
+        }
+        for wo in w.worlds:
+            wo_d = {"name": wo.name, "totalEntities": wo.total_entities, "regions": []}
+            for r in wo.regions:
+                r_d = {"totalEntities": r.total_entities, "chunks": []}
+                for c in r.chunks:
+                    r_d["chunks"].append({
+                        "x": c.x, "z": c.z,
+                        "totalEntities": c.total_entities,
+                        "entityCounts": dict(c.entity_counts),
+                    })
+                wo_d["regions"].append(r_d)
+            world_d["worlds"].append(wo_d)
+        d["world"] = world_d
+    if ps.HasField("online_mode"):
+        d["onlineMode"] = ps.online_mode.online
+    return d
+
+
+def _proto_system_stats_to_dict(ss):
+    d = {}
+    if ss.HasField("cpu"):
+        cpu = ss.cpu
+        cpu_d = {
+            "threads": cpu.threads,
+            "modelName": cpu.model_name,
+        }
+        if cpu.HasField("process_usage"):
+            cpu_d["processUsage"] = {"last1m": cpu.process_usage.last1m, "last15m": cpu.process_usage.last15m}
+        if cpu.HasField("system_usage"):
+            cpu_d["systemUsage"] = {"last1m": cpu.system_usage.last1m, "last15m": cpu.system_usage.last15m}
+        d["cpu"] = cpu_d
+    if ss.HasField("memory"):
+        mem = ss.memory
+        mem_d = {}
+        if mem.HasField("physical"):
+            mem_d["physical"] = {"used": mem.physical.used, "total": mem.physical.total}
+        if mem.HasField("swap"):
+            mem_d["swap"] = {"used": mem.swap.used, "total": mem.swap.total}
+        d["memory"] = mem_d
+    gc_map = {}
+    for name in ss.gc:
+        gc_map[name] = _proto_gc_to_dict(ss.gc[name])
+    if gc_map:
+        d["gc"] = gc_map
+    if ss.HasField("disk"):
+        d["disk"] = {"total": ss.disk.total, "free": ss.disk.free}
+    if ss.HasField("os"):
+        d["os"] = {"name": ss.os.name, "arch": ss.os.arch, "version": ss.os.version}
+    if ss.HasField("java"):
+        d["java"] = {"version": ss.java.version, "vendor": ss.java.vendor}
+        if ss.java.runtime_name:
+            d["java"]["runtimeName"] = ss.java.runtime_name
+        if ss.java.flags:
+            d["jvm_flags"] = ss.java.flags
+    d["uptime"] = ss.uptime
+    if ss.HasField("jvm"):
+        d["jvm"] = {"name": ss.jvm.name, "version": ss.jvm.version, "vendor": ss.jvm.vendor}
+    return d
+
+
+def _proto_window_stats_to_dict(ws):
+    return {
+        "ticks": ws.ticks,
+        "cpu_process": ws.cpu_process,
+        "cpu_system": ws.cpu_system,
+        "tps": ws.tps,
+        "mspt_median": ws.mspt_median,
+        "mspt_max": ws.mspt_max,
+        "players": ws.players,
+        "entities": ws.entities,
+        "tile_entities": ws.tile_entities,
+        "chunks": ws.chunks,
+        "start_time": ws.start_time,
+        "end_time": ws.end_time,
+        "duration": ws.duration,
+    }
+
+
+def parse_protobuf_sampler(data_bytes):
+    if not _ensure_proto():
+        return None
+    sampler = spark_pb2.SamplerData()
+    sampler.ParseFromString(data_bytes)
+    meta = sampler.metadata
+    pm = meta.platform_metadata
+
+    sources = {}
+    for key in meta.sources:
+        s = meta.sources[key]
+        sources[key] = {
+            "name": s.name,
+            "version": s.version,
+            "author": s.author,
+            "description": s.description,
+        }
+
+    data_aggregator = meta.data_aggregator
+
+    result = {
+        "type": "sampler",
+        "metadata": {
+            "platformMetadata": {
+                "type": PROTO_TYPE_MAP.get(pm.type, pm.type),
+                "name": pm.name,
+                "version": pm.version,
+                "minecraftVersion": pm.minecraft_version,
+                "sparkVersion": pm.spark_version,
+                "brand": pm.brand,
+            },
+            "interval": meta.interval,
+            "startTime": meta.start_time,
+            "endTime": meta.end_time,
+            "numberOfTicks": meta.number_of_ticks,
+            "samplerMode": SAMPLER_MODE_MAP.get(meta.sampler_mode, meta.sampler_mode),
+            "samplerEngine": SAMPLER_ENGINE_MAP.get(meta.sampler_engine, meta.sampler_engine),
+            "samplerEngineVersion": meta.sampler_engine_version,
+            "dataAggregator": {
+                "type": AGGREGATOR_TYPE_MAP.get(data_aggregator.type, data_aggregator.type),
+                "threadGrouper": THREAD_GROUPER_MAP.get(data_aggregator.thread_grouper, data_aggregator.thread_grouper),
+                "tickLengthThreshold": data_aggregator.tick_length_threshold,
+                "numberOfIncludedTicks": data_aggregator.number_of_included_ticks,
+            },
+            "serverConfigurations": dict(meta.server_configurations),
+            "sources": sources,
+            "comment": meta.comment,
+        },
+        "threads": [_proto_thread_to_dict(t) for t in sampler.threads],
+        "classSources": dict(sampler.class_sources),
+        "methodSources": dict(sampler.method_sources),
+        "lineSources": dict(sampler.line_sources),
+        "timeWindows": list(sampler.time_windows),
+    }
+
+    if sampler.HasField("metadata"):
+        if meta.HasField("platform_statistics"):
+            result["metadata"]["platformStatistics"] = _proto_platform_stats_to_dict(meta.platform_statistics)
+        if meta.HasField("system_statistics"):
+            result["metadata"]["systemStatistics"] = _proto_system_stats_to_dict(meta.system_statistics)
+
+    ws = {}
+    for key in sampler.time_window_statistics:
+        ws[str(key)] = _proto_window_stats_to_dict(sampler.time_window_statistics[key])
+    if ws:
+        result["timeWindowStatistics"] = ws
+
+    return result
+
+
+def parse_protobuf_heap(data_bytes):
+    if not _ensure_proto():
+        return None
+    heap = spark_pb2.HeapData()
+    heap.ParseFromString(data_bytes)
+    meta = heap.metadata
+    pm = meta.platform_metadata
+
+    result = {
+        "type": "heap",
+        "metadata": {
+            "platformMetadata": {
+                "type": PROTO_TYPE_MAP.get(pm.type, pm.type),
+                "name": pm.name,
+                "version": pm.version,
+                "minecraftVersion": pm.minecraft_version,
+                "sparkVersion": pm.spark_version,
+                "brand": pm.brand,
+            },
+        },
+        "entries": [],
+    }
+
+    if meta.HasField("platform_statistics"):
+        result["metadata"]["platformStatistics"] = _proto_platform_stats_to_dict(meta.platform_statistics)
+    if meta.HasField("system_statistics"):
+        result["metadata"]["systemStatistics"] = _proto_system_stats_to_dict(meta.system_statistics)
+
+    sources = {}
+    for key in meta.sources:
+        s = meta.sources[key]
+        sources[key] = {"name": s.name, "version": s.version, "author": s.author, "description": s.description}
+    if sources:
+        result["metadata"]["sources"] = sources
+
+    for entry in heap.entries:
+        result["entries"].append({
+            "order": entry.order,
+            "instances": entry.instances,
+            "size": entry.size,
+            "type": entry.type,
+        })
+
+    return result
+
+
+def parse_protobuf_health(data_bytes):
+    if not _ensure_proto():
+        return None
+    health = spark_pb2.HealthData()
+    health.ParseFromString(data_bytes)
+    meta = health.metadata
+    pm = meta.platform_metadata
+
+    result = {
+        "type": "health",
+        "metadata": {
+            "platformMetadata": {
+                "type": PROTO_TYPE_MAP.get(pm.type, pm.type),
+                "name": pm.name,
+                "version": pm.version,
+                "minecraftVersion": pm.minecraft_version,
+                "sparkVersion": pm.spark_version,
+                "brand": pm.brand,
+            },
+        },
+    }
+
+    if meta.HasField("system_statistics"):
+        result["metadata"]["systemStatistics"] = _proto_system_stats_to_dict(meta.system_statistics)
+
+    ws = {}
+    for key in health.time_window_statistics:
+        ws[str(key)] = _proto_window_stats_to_dict(health.time_window_statistics[key])
+    if ws:
+        result["timeWindowStatistics"] = ws
+
+    return result
+
+
+def parse_protobuf_file(path):
+    with open(path, "rb") as f:
+        data_bytes = f.read()
+
+    for parser in [parse_protobuf_sampler, parse_protobuf_heap, parse_protobuf_health]:
+        try:
+            result = parser(data_bytes)
+            if result:
+                return result
+        except Exception:
+            continue
+    return None
 
 
 def extract_id(url_or_id):
@@ -104,8 +503,25 @@ def load_data(source):
         except Exception:
             return None, None
     if os.path.isfile(source):
-        with open_file(source) as f:
-            content = f.read()
+        with open(source, "rb") as f:
+            header = f.read(4)
+        is_binary = False
+        try:
+            with open(source, "r", encoding="utf-8") as f:
+                f.read(1)
+        except (UnicodeDecodeError, UnicodeError):
+            is_binary = True
+        if is_binary or header[0] not in (0x7b, 0x5b, 0x7d, 0x22, 0x09, 0x0a, 0x0d, 0x20):
+            proto_result = parse_protobuf_file(source)
+            if proto_result:
+                return proto_result, "file_protobuf"
+        p = str(source).lower()
+        if p.endswith(".gz"):
+            with gzip.open(source, "rt", encoding="utf-8") as f:
+                content = f.read()
+        else:
+            with open(source, "r", encoding="utf-8") as f:
+                content = f.read()
         try:
             data = json.loads(content)
             return data, "file_json"
@@ -128,8 +544,10 @@ def get_profile_type(data):
 def get_platform_meta(meta):
     pm = meta.get("platformMetadata", meta.get("platform", {}))
     type_map = {0: "SERVER", 1: "CLIENT", 2: "PROXY", 3: "APPLICATION"}
+    raw_type = pm.get("type", 0)
+    ptype = type_map.get(raw_type, "UNKNOWN") if isinstance(raw_type, int) else raw_type
     result = {
-        "type": type_map.get(pm.get("type", 0), "UNKNOWN"),
+        "type": ptype,
         "name": pm.get("name", "unknown"),
         "version": pm.get("version", "unknown"),
         "minecraft_version": pm.get("minecraftVersion", pm.get("minecraft_version", "unknown")),
@@ -442,10 +860,17 @@ def cmd_info(args):
         if jvm:
             result["system"]["jvm_name"] = jvm.get("name", "unknown")
             result["system"]["jvm_version"] = jvm.get("version", "unknown")
+            if jvm.get("vendor"):
+                result["system"]["jvm_vendor"] = jvm["vendor"]
 
     configs = meta.get("serverConfigurations", meta.get("server_configurations", {}))
     if configs:
         result["jvm_flags"] = configs.get("jvm_args", configs.get("flags", ""))
+
+    if sstats and not result.get("jvm_flags"):
+        jvm_flags = sstats.get("jvm_flags", "")
+        if jvm_flags:
+            result["jvm_flags"] = jvm_flags
 
     if pstats:
         mem = pstats.get("memory", {})
@@ -481,12 +906,22 @@ def cmd_info(args):
     if sampler_meta:
         mode = meta.get("samplerMode", meta.get("sampler_mode"))
         engine = meta.get("samplerEngine", meta.get("sampler_engine"))
+        if isinstance(mode, int):
+            mode = SAMPLER_MODE_MAP.get(mode, mode)
+        if isinstance(engine, int):
+            engine = SAMPLER_ENGINE_MAP.get(engine, engine)
+        agg_type = sampler_meta.get("type")
+        if isinstance(agg_type, int):
+            agg_type = AGGREGATOR_TYPE_MAP.get(agg_type, agg_type)
+        tg = sampler_meta.get("threadGrouper", sampler_meta.get("thread_grouper"))
+        if isinstance(tg, int):
+            tg = THREAD_GROUPER_MAP.get(tg, tg)
         result["sampler"] = {
             "interval_ms": meta.get("interval", 4),
             "mode": mode,
             "engine": engine,
-            "aggregator_type": sampler_meta.get("type"),
-            "thread_grouper": sampler_meta.get("threadGrouper", sampler_meta.get("thread_grouper")),
+            "aggregator_type": agg_type,
+            "thread_grouper": tg,
             "tick_threshold": sampler_meta.get("tickLengthThreshold", sampler_meta.get("tick_length_threshold")),
             "included_ticks": sampler_meta.get("numberOfIncludedTicks", sampler_meta.get("number_of_included_ticks")),
         }
