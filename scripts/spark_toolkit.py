@@ -2113,6 +2113,461 @@ def cmd_recommend(args):
     return result
 
 
+def _parse_simple_yaml(text):
+    lines = text.splitlines()
+    result = {}
+    stack = [(result, 0)]
+    for raw_line in lines:
+        stripped = raw_line.rstrip()
+        if not stripped or stripped.lstrip().startswith("#"):
+            continue
+        indent = len(stripped) - len(stripped.lstrip())
+        content = stripped.strip()
+        while len(stack) > 1 and stack[-1][1] >= indent:
+            stack.pop()
+        if content.endswith(":"):
+            key = content[:-1].strip()
+            new_dict = {}
+            stack[-2][0][key] = new_dict if isinstance(stack[-1][0], dict) else new_dict
+            stack[-1][0][key] = new_dict
+            stack.append((new_dict, indent))
+        elif ":" in content:
+            colon_idx = content.index(":")
+            key = content[:colon_idx].strip()
+            val = content[colon_idx + 1:].strip()
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            elif val.startswith("'") and val.endswith("'"):
+                val = val[1:-1]
+            elif val.lower() == "true":
+                val = True
+            elif val.lower() == "false":
+                val = False
+            elif val.lower() == "default":
+                val = "default"
+            else:
+                try:
+                    val = int(val) if "." not in val else float(val)
+                except (ValueError, TypeError):
+                    pass
+            stack[-1][0][key] = val
+            stack[-1] = (stack[-1][0], indent)
+    return result
+
+
+def _parse_json5(text):
+    json5_text = text
+    json5_text = re.sub(r'(?<!:)//.*$', '', json5_text, flags=re.MULTILINE)
+    json5_text = re.sub(r'/\*[\s\S]*?\*/', '', json5_text)
+    json5_text = re.sub(r',\s*([}\]])', r'\1', json5_text)
+    json5_text = re.sub(r'(?<=[{,\[])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'"\1":', json5_text)
+    try:
+        return json.loads(json5_text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _parse_server_properties(text):
+    result = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        try:
+            val = int(val)
+        except ValueError:
+            try:
+                val = float(val)
+            except ValueError:
+                if val.lower() == "true":
+                    val = True
+                elif val.lower() == "false":
+                    val = False
+        result[key] = val
+    return result
+
+
+def _get_nested(d, *keys, default=None):
+    current = d
+    for k in keys:
+        if isinstance(current, dict) and k in current:
+            current = current[k]
+        else:
+            return default
+    return current
+
+
+def _load_config_file(path):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        return None
+    name = os.path.basename(path).lower()
+    stripped = text.strip()
+    if name == "server.properties":
+        return _parse_server_properties(text)
+    elif name.endswith(".json5") or name.endswith(".json5.yml") or "json5" in name:
+        parsed = _parse_json5(text)
+        if parsed:
+            return parsed
+        return _parse_simple_yaml(text)
+    elif stripped.startswith("{") or stripped.startswith("["):
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            parsed = _parse_json5(text)
+            if parsed:
+                return parsed
+            return _parse_simple_yaml(text)
+    else:
+        yaml_result = _parse_simple_yaml(text)
+        if yaml_result:
+            return yaml_result
+        parsed = _parse_json5(text)
+        if parsed:
+            return parsed
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+
+def _deep_merge(base, override):
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+CFG_SAFE_VALUES = {
+    "hopper-transfer": (8, [1], "NEVER set to 1 — causes massive hopper lag and breaks all hopper timing. Keep at 8."),
+    "hopper-amount": (1, [], "Keep at 1. Changing alters game economy and breaks hopper systems."),
+    "max-entity-collisions": (8, list(range(0, 3)), "Must be >= 3. Below 3 breaks minecarts, boats, and entity interactions."),
+}
+
+CFG_DEPENDENCY_RULES = [
+    {
+        "check": lambda c: _get_nested(c, "spigot", "world-settings", "default", "mob-spawn-range", default=None),
+        "depends_on": "simulation-distance",
+        "rule": "mob-spawn-range must be <= simulation-distance - 1",
+        "validate": lambda c: (_get_nested(c, "spigot", "world-settings", "default", "mob-spawn-range", default=8) or 8) <= ((_get_nested(c, "server_properties", "simulation-distance", default=10) or 10) - 1),
+        "fix": "Set mob-spawn-range to simulation-distance - 1 or lower",
+    },
+    {
+        "check": lambda c: _get_nested(c, "spigot", "world-settings", "default", "mob-spawn-range", default=None),
+        "rule": "mob-spawn-range must be >= 3",
+        "validate": lambda c: (_get_nested(c, "spigot", "world-settings", "default", "mob-spawn-range", default=8) or 8) >= 3,
+        "fix": "Set mob-spawn-range to at least 3",
+    },
+    {
+        "check": lambda c: _get_nested(c, "server_properties", "view-distance", default=None),
+        "depends_on": "simulation-distance",
+        "rule": "view-distance must be >= simulation-distance",
+        "validate": lambda c: (_get_nested(c, "server_properties", "view-distance", default=10) or 10) >= (_get_nested(c, "server_properties", "simulation-distance", default=10) or 10),
+        "fix": "Set view-distance >= simulation-distance",
+    },
+    {
+        "check": lambda c: True,
+        "rule": "bukkit spawn-limits must match mob-spawn-range for desired density",
+        "validate": None,
+        "fix": "When lowering spawn-limits, also lower mob-spawn-range proportionally. See spawn-limit cheat sheet in optimization guide.",
+    },
+]
+
+GAMEMODE_PLUGIN_KEYWORDS = {
+    "bedwars": {"bedwars", "bed_war", "bedwarsrel", "bedwar", "bw1058", "bw2023", "bw-", "bedwars1058"},
+    "skyblock": {"skyblock", "a skyblock", "askyblock", " SuperiorSkyblock", "superiorskyblock", "bskyblock", "fabledskyblock", "island", "islands"},
+    "skywars": {"skywars", "sky_war", "skywarsrel"},
+    "lobby": {"lobby", "hub", "bungeecordhub", "lobbybalancer", "compassnav", "bungeecord hub", "multiverse-portals"},
+    "factions": {"factions", "factionswars", "kingdoms", "towny", "sabrefactions"},
+    "creative": {"creative", "plotme", "plotsquared", "worldedit", "fastasyncworldedit"},
+    "modded": {"forge", "fabric", "neoforge", "modloader"},
+}
+
+
+def _detect_gamemode(data, meta, platform):
+    plugins_raw = meta.get("sources", {})
+    plugin_names = set()
+    if isinstance(plugins_raw, dict):
+        for pkg, info in plugins_raw.items():
+            if isinstance(info, dict):
+                name = info.get("name", "").lower()
+                if name:
+                    plugin_names.add(name)
+                    desc = info.get("description", "").lower()
+                    if desc:
+                        plugin_names.update(desc.split())
+            elif isinstance(info, str):
+                plugin_names.add(info.lower())
+    platform_name = platform.get("name", "").lower()
+    if any(kw in platform_name for kw in ("forge", "fabric", "neoforge")):
+        return "modded"
+    scores = {gm: 0 for gm in GAMEMODE_PLUGIN_KEYWORDS}
+    for gamemode, keywords in GAMEMODE_PLUGIN_KEYWORDS.items():
+        for kw in keywords:
+            for pname in plugin_names:
+                if kw in pname:
+                    scores[gamemode] = scores.get(gamemode, 0) + 1
+    best = max(scores, key=scores.get)
+    if scores[best] >= 2:
+        return best
+    best_single = max(scores, key=scores.get)
+    if scores[best_single] >= 1:
+        return best_single
+    return "unknown"
+
+
+CFG_GAMEMODE_RULES = {
+    "smp": {
+        "name": "SMP / Survival",
+        "never_disable": ["doMobSpawning", "doDaylightCycle"],
+        "never_change": {"hopper-transfer": 8, "max-entity-collisions": {"min": 3}, "simulation-distance": {"min": 4}},
+        "safe_ranges": {
+            "view-distance": (5, 8),
+            "simulation-distance": (4, 6),
+            "spawn-limits.monsters": (20, 70),
+            "merge-radius.item": (2.5, 4.5),
+        },
+        "warnings": {"simulation-distance < 4": "Farms break. Mobs won't spawn correctly.", "tick-inactive-villagers: false": "Iron golem farms and trading halls break."},
+    },
+    "lobby": {
+        "name": "Lobby / Hub",
+        "never_disable": [],
+        "never_change": {"hopper-transfer": 8},
+        "safe_ranges": {
+            "view-distance": (3, 5),
+            "simulation-distance": (0, 4),
+            "spawn-limits.monsters": (0, 0),
+            "merge-radius.item": (5.0, 20.0),
+        },
+        "warnings": {},
+    },
+    "bedwars": {
+        "name": "Bedwars / Skywars",
+        "never_disable": [],
+        "never_change": {"hopper-transfer": 8, "max-entity-collisions": {"min": 4}, "simulation-distance": {"min": 4}},
+        "safe_ranges": {
+            "view-distance": (4, 6),
+            "simulation-distance": (4, 6),
+            "merge-radius.item": (2.5, 3.5),
+            "max-entity-collisions": (4, 8),
+        },
+        "warnings": {"merge-radius.item > 5": "Resources merge mid-air at generators. Breaks game feel.", "max-entity-collisions < 4": "TNT knockback breaks. Entity interactions fail."},
+    },
+    "skyblock": {
+        "name": "Skyblock",
+        "never_disable": [],
+        "never_change": {"hopper-transfer": 8, "simulation-distance": {"min": 4}},
+        "safe_ranges": {
+            "view-distance": (4, 5),
+            "simulation-distance": (4, 4),
+            "merge-radius.item": (3.5, 4.5),
+            "merge-radius.exp": (5.0, 6.0),
+        },
+        "warnings": {"hopper-transfer != 8": "Skyblock REQUIRES hoppers. Any change breaks farm timing.", "merge-radius > 5": "Farm items teleport together, breaking collection systems."},
+    },
+    "factions": {
+        "name": "Factions / PvP",
+        "never_disable": ["doMobSpawning"],
+        "never_change": {"hopper-transfer": 8, "max-entity-collisions": {"min": 3}, "entity-tracking-range.players": {"min": 48}, "arrow-despawn-rate": {"min": 100}},
+        "safe_ranges": {
+            "view-distance": (5, 7),
+            "simulation-distance": (4, 6),
+            "entity-tracking-range.players": (48, 128),
+        },
+        "warnings": {"entity-tracking-range.players < 48": "Players become invisible at distance. PvP-breaking."},
+    },
+    "creative": {
+        "name": "Creative / Building",
+        "never_disable": [],
+        "never_change": {"hopper-transfer": 8},
+        "safe_ranges": {
+            "view-distance": (7, 12),
+            "simulation-distance": (0, 4),
+            "spawn-limits.monsters": (0, 0),
+        },
+        "warnings": {"view-distance too low": "Builders can't see their creations."},
+    },
+    "modded": {
+        "name": "Modded (Fabric/Forge)",
+        "never_disable": ["doMobSpawning"],
+        "never_change": {"hopper-transfer": 8, "simulation-distance": {"min": 4}},
+        "safe_ranges": {
+            "view-distance": (4, 6),
+            "simulation-distance": (4, 4),
+        },
+        "warnings": {"low entity-activation-range": "Many mods bypass activation range. Some hard-crash if entities aren't ticked.", "low spawn-limits": "Mod entities count toward caps. Too low prevents mod mobs from spawning."},
+    },
+    "unknown": {
+        "name": "Unknown (Conservative Defaults)",
+        "never_disable": [],
+        "never_change": {"hopper-transfer": 8, "max-entity-collisions": {"min": 3}, "simulation-distance": {"min": 4}},
+        "safe_ranges": {
+            "view-distance": (4, 7),
+            "simulation-distance": (4, 6),
+        },
+        "warnings": {},
+    },
+}
+
+
+def _analyze_configs(configs, gamemode, platform):
+    findings = []
+    sp = configs.get("server_properties", {})
+    spigot = configs.get("spigot", {})
+    bukkit = configs.get("bukkit", {})
+    paper_global = configs.get("paper_global", {})
+    paper_world = configs.get("paper_world", {})
+    is_paper = platform in ("paper", "folia", "canvas")
+    gamemode_rules = CFG_GAMEMODE_RULES.get(gamemode, CFG_GAMEMODE_RULES["unknown"])
+    is_unknown_gamemode = (gamemode == "unknown")
+
+    view_dist = _get_nested(sp, "view-distance", default=10)
+    sim_dist = _get_nested(sp, "simulation-distance", default=10)
+    online_mode = _get_nested(sp, "online-mode", default=True)
+
+    if view_dist and sim_dist:
+        if view_dist < sim_dist:
+            findings.append({"severity": "CRITICAL", "category": "config_dependency", "setting": "view-distance < simulation-distance", "current": f"view-distance={view_dist}, simulation-distance={sim_dist}", "detail": "view-distance must be >= simulation-distance. Rendering breaks if view is smaller than tick distance.", "action": f"Set view-distance >= {sim_dist}"})
+        if sim_dist < 4 and gamemode not in ("lobby", "creative"):
+            gm_label = gamemode_rules['name'] if not is_unknown_gamemode else "servers with gameplay"
+            findings.append({"severity": "CRITICAL", "category": "gameplay_break", "setting": "simulation-distance", "current": str(sim_dist), "detail": f"simulation-distance of {sim_dist} breaks mob spawning, farms, and vanilla mechanics for {gm_label}.", "action": "Set simulation-distance to at least 4 for any world with gameplay."})
+
+    if online_mode is False and not is_paper:
+        findings.append({"severity": "WARNING", "category": "security", "setting": "online-mode=false", "current": "false", "detail": "online-mode is false without a proxy. Anyone can join with any username.", "action": "Set online-mode=true unless using BungeeCord/Velocity with forwarding."})
+
+    mob_spawn_range = _get_nested(spigot, "world-settings", "default", "mob-spawn-range", default=8)
+    if mob_spawn_range and sim_dist:
+        if mob_spawn_range > (sim_dist - 1):
+            findings.append({"severity": "WARNING", "category": "config_dependency", "setting": "mob-spawn-range > simulation-distance - 1", "current": f"mob-spawn-range={mob_spawn_range}, simulation-distance={sim_dist}", "detail": "Mobs attempt to spawn outside simulation distance, wasting spawn cycles and reducing density.", "action": f"Set mob-spawn-range to {sim_dist - 1} or lower"})
+        if mob_spawn_range < 3:
+            findings.append({"severity": "WARNING", "category": "config_dependency", "setting": "mob-spawn-range too low", "current": str(mob_spawn_range), "detail": "mob-spawn-range below 3 drastically reduces spawnable area. Mobs cannot spawn within 24 blocks of players.", "action": "Set mob-spawn-range to at least 3"})
+
+    hopper_transfer = _get_nested(spigot, "world-settings", "default", "hopper-transfer", default=None)
+    ticks_hopper = _get_nested(spigot, "world-settings", "default", "ticks-per", "hopper-transfer", default=None)
+    hopper_val = hopper_transfer or ticks_hopper
+    if hopper_val is not None and hopper_val != 8:
+        if hopper_val == 1:
+            findings.append({"severity": "CRITICAL", "category": "bug_config", "setting": "hopper-transfer", "current": str(hopper_val), "detail": "hopper-transfer=1 makes hoppers process every tick (8x normal). This is the #1 cause of hopper lag on servers. It also breaks item sorters and redstone timing.", "action": "Set hopper-transfer to 8 (default). This is a NEVER-CHANGE value."})
+        elif hopper_val > 8:
+            findings.append({"severity": "WARNING", "category": "bug_config", "setting": "hopper-transfer", "current": str(hopper_val), "detail": f"hopper-transfer={hopper_val} makes hoppers slower than vanilla. Item sorters and farm timing break.", "action": "Set hopper-transfer to 8 (default)."})
+
+    max_entity_collisions = _get_nested(spigot, "world-settings", "default", "max-entity-collisions", default=None)
+    if max_entity_collisions is not None and max_entity_collisions < 3:
+        findings.append({"severity": "CRITICAL", "category": "bug_config", "setting": "max-entity-collisions", "current": str(max_entity_collisions), "detail": f"max-entity-collisions={max_entity_collisions} is below 3. Minecarts won't link, boats break, entity interactions fail.", "action": "Set max-entity-collisions to at least 3. Use 4-8 for servers with entity interaction needs (PvP, Bedwars)."})
+
+    merge_item = _get_nested(spigot, "world-settings", "default", "merge-radius", "item", default=None)
+    if merge_item is not None:
+        if not is_unknown_gamemode and gamemode in ("bedwars", "skyblock") and merge_item > 3.5:
+            findings.append({"severity": "WARNING", "category": "gamemode_break", "setting": "merge-radius.item", "current": str(merge_item), "detail": f"merge-radius.item={merge_item} is too high for {gamemode_rules['name']}. Items merge mid-air at generators/farms, breaking game feel.", "action": f"Set merge-radius.item to 2.5-3.5 for {gamemode_rules['name']}"})
+        elif not is_unknown_gamemode and merge_item > 5.0 and gamemode not in ("lobby", "creative"):
+            findings.append({"severity": "WARNING", "category": "bug_config", "setting": "merge-radius.item", "current": str(merge_item), "detail": f"merge-radius.item={merge_item} causes items to teleport together mid-air. Farm collection systems break.", "action": "Set merge-radius.item to 3.0-4.0 for SMP, 2.5-3.5 for PvP/Skyblock."})
+
+    nerf_spawner = _get_nested(spigot, "world-settings", "default", "nerf-spawner-mobs", default=None)
+    if nerf_spawner is True and gamemode in ("smp", "skyblock") and not is_unknown_gamemode:
+        findings.append({"severity": "WARNING", "category": "gameplay_break", "setting": "nerf-spawner-mobs", "current": "true", "detail": f"nerf-spawner-mobs=true removes ALL AI from spawner mobs. Any farm using spawner mob AI breaks for {gamemode_rules['name']}.", "action": "Set to false, or if needed set spawner-nerfed-mobs-should-jump=true in paper-world."})
+
+    tick_inactive_villagers = None
+    if is_paper:
+        tick_inactive_villagers = _get_nested(paper_global, "entities", "activation-range", "tick-inactive-villagers", default=None)
+        if tick_inactive_villagers is False and gamemode in ("smp", "skyblock") and not is_unknown_gamemode:
+            findings.append({"severity": "WARNING", "category": "gameplay_break", "setting": "tick-inactive-villagers", "current": "false", "detail": f"tick-inactive-villagers=false breaks iron golem farms and villager restocking when no player is nearby. Critical for {gamemode_rules['name']}.", "action": "Set to true for SMP/Skyblock, or use VillagerLobotimizer plugin as alternative."})
+
+    entity_act = {}
+    act_section = _get_nested(spigot, "world-settings", "default", "entity-activation-range", default={})
+    if act_section:
+        entity_act = act_section
+    if is_paper:
+        paper_act = _get_nested(paper_global, "entities", "activation-range", default={})
+        if paper_act:
+            entity_act = _deep_merge(entity_act, paper_act)
+
+    if entity_act and sim_dist:
+        max_activation = (sim_dist - 1) * 16
+        for category in ("animals", "monsters", "villagers", "flying-monsters", "raiders"):
+            val = entity_act.get(category)
+            if val is not None and val > max_activation:
+                findings.append({"severity": "WARNING", "category": "config_dependency", "setting": f"entity-activation-range.{category}", "current": str(val), "detail": f"entity-activation-range.{category}={val} exceeds (simulation-distance-1)*16={max_activation}. Entities beyond sim distance won't tick anyway.", "action": f"Set to {max_activation} or lower."})
+
+    spawn_limits_monsters = _get_nested(bukkit, "spawn-limits", "monsters", default=None)
+    if spawn_limits_monsters is not None and spawn_limits_monsters > 50 and gamemode in ("smp",) and not is_unknown_gamemode:
+        findings.append({"severity": "LOW", "category": "optimization", "setting": "spawn-limits.monsters", "current": str(spawn_limits_monsters), "detail": f"spawn-limits.monsters={spawn_limits_monsters} is high for SMP. High spawn counts = more entity CPU.", "action": "Consider 30-50 for balanced performance, adjusting mob-spawn-range proportionally."})
+
+    entity_tracking_players = _get_nested(spigot, "world-settings", "default", "entity-tracking-range", "players", default=None)
+    if is_paper:
+        paper_track_players = _get_nested(paper_global, "entities", "tracking-range", "players", default=None)
+        if paper_track_players:
+            entity_tracking_players = paper_track_players
+    if entity_tracking_players is not None and entity_tracking_players < 48 and gamemode in ("factions",) and not is_unknown_gamemode:
+        findings.append({"severity": "CRITICAL", "category": "gamemode_break", "setting": "entity-tracking-range.players", "current": str(entity_tracking_players), "detail": f"entity-tracking-range.players={entity_tracking_players} is too low for {gamemode_rules['name']}. Players become invisible at distance in PvP.", "action": "Set to at least 48 for PvP servers."})
+
+    arrow_despawn = _get_nested(spigot, "world-settings", "default", "arrow-despawn-rate", default=None)
+    if arrow_despawn is not None and arrow_despawn < 100 and gamemode in ("factions", "bedwars") and not is_unknown_gamemode:
+        findings.append({"severity": "WARNING", "category": "gamemode_break", "setting": "arrow-despawn-rate", "current": str(arrow_despawn), "detail": f"arrow-despawn-rate={arrow_despawn} is below 100. Arrows vanish during bow combat in {gamemode_rules['name']}.", "action": "Set to 100-300 for PvP servers."})
+
+    if is_paper:
+        despawn_hard_h = _get_nested(paper_world, "entities", "spawning", "despawn-ranges", "monster", "hard", "horizontal", default=None)
+        if despawn_hard_h is not None and sim_dist:
+            expected = (sim_dist - 1) * 16
+            if despawn_hard_h < 36:
+                findings.append({"severity": "WARNING", "category": "bug_config", "setting": "despawn-ranges.monster.hard.horizontal", "current": str(despawn_hard_h), "detail": f"despawn-ranges.hard.horizontal={despawn_hard_h} is below 36. Mobs vanish while player can see them, breaking farms.", "action": f"Set to at least 36, ideally {(sim_dist - 1) * 16}"})
+            elif sim_dist < 10 and despawn_hard_h != expected and despawn_hard_h > expected:
+                findings.append({"severity": "INFO", "category": "optimization", "setting": "despawn-ranges.monster.hard.horizontal", "current": str(despawn_hard_h), "detail": f"With simulation-distance={sim_dist}, ideal despawn hard horizontal is {expected}.", "action": f"Set to {expected} for best mob despawn behavior."})
+
+    prevent_moving = _get_nested(paper_world, "chunks", "prevent-moving-into-unloaded-chunks", default=None)
+    if prevent_moving is False and is_paper:
+        findings.append({"severity": "LOW", "category": "optimization", "setting": "prevent-moving-into-unloaded-chunks", "current": "false", "detail": "Disabling this causes sync chunk loads when players move into unloaded chunks, causing lag spikes.", "action": "Set to true (recommended)."})
+
+    alt_despawn = _get_nested(paper_world, "entities", "spawning", "alt-item-despawn-rate", "enabled", default=None)
+    if alt_despawn is False and gamemode in ("smp", "skyblock") and not is_unknown_gamemode:
+        findings.append({"severity": "LOW", "category": "optimization", "setting": "alt-item-despawn-rate.enabled", "current": "false", "detail": f"alt-item-despawn-rate is disabled. Enabling it speeds up despawn of common junk items (cobblestone, netherrack) without affecting farm items.", "action": "Enable alt-item-despawn-rate and configure junk items."})
+
+    redstone_impl = _get_nested(paper_world, "misc", "redstone-implementation", default=None)
+    if redstone_impl and redstone_impl == "VANILLA" and is_paper:
+        findings.append({"severity": "LOW", "category": "optimization", "setting": "redstone-implementation", "current": "VANILLA", "detail": "ALTERNATE_CURRENT is more efficient. Behavior differs slightly from Vanilla.", "action": "Set to ALTERNATE_CURRENT for better performance. Test redstone builds first."})
+
+    epcl_item = _get_nested(paper_world, "entities", "spawning", "entity-per-chunk-save-limit", "item", default=None)
+    if epcl_item is None and is_paper:
+        findings.append({"severity": "WARNING", "category": "security", "setting": "entity-per-chunk-save-limit.item", "current": "not set", "detail": "entity-per-chunk-save-limit is not set for items. Players can crash the server by loading chunks full of items.", "action": "Set entity-per-chunk-save-limit.item to 40-100."})
+
+    canvas_config = configs.get("canvas_config", {})
+    if canvas_config and "canvas" in platform:
+        async_chunks = _get_nested(canvas_config, "performance", "enable-async-chunks", default=None)
+        if async_chunks is False:
+            findings.append({"severity": "LOW", "category": "optimization", "setting": "canvas enable-async-chunks", "current": "false", "detail": "Async chunk loading is disabled on Canvas. Enabling it distributes chunk loading across threads.", "action": "Set enable-async-chunks to true."})
+        async_mobs = _get_nested(canvas_config, "performance", "enable-async-mobs", default=None)
+        if async_mobs is False:
+            findings.append({"severity": "LOW", "category": "optimization", "setting": "canvas enable-async-mobs", "current": "false", "detail": "Async mob spawning is disabled on Canvas. Enabling it distributes mob spawn calculations.", "action": "Set enable-async-mobs to true."})
+
+    purpur_config = configs.get("purpur_config", {})
+    if purpur_config:
+        purpur_anti_xray = _get_nested(purpur_config, "settings", "anti-xray", default=None)
+        if purpur_anti_xray is not None and is_paper:
+            findings.append({"severity": "INFO", "category": "optimization", "setting": "purpur anti-xray", "current": str(purpur_anti_xray), "detail": "Purpur has its own anti-xray settings. Paper also has anti-xray. Using both may cause conflicts.", "action": "Use Paper's anti-xray (paper-world.yml) or Purpur's, not both."})
+
+    velocity_config = configs.get("velocity_config", {})
+    if velocity_config:
+        vel_online_mode = _get_nested(velocity_config, "online-mode", default=None)
+        if vel_online_mode is False:
+            findings.append({"severity": "WARNING", "category": "security", "setting": "velocity online-mode", "current": "false", "detail": "Velocity online-mode is false. Players can join with any username unless you have a forwarding secret configured.", "action": "Set online-mode to true, or ensure forwarding-secret is properly configured."})
+        vel_compression = _get_nested(velocity_config, "advanced", "compression-threshold", default=None)
+        if vel_compression is not None and vel_compression > 512:
+            findings.append({"severity": "LOW", "category": "optimization", "setting": "velocity compression-threshold", "current": str(vel_compression), "detail": f"Velocity compression threshold of {vel_compression} may cause noticeable lag on slow connections.", "action": "Consider a threshold of 256-512."})
+
+    return findings
+
+
 def cmd_check_config(args):
     data, src = load_data(args.source)
     if not data:
@@ -2137,102 +2592,439 @@ def cmd_check_config(args):
         "platform": platform,
         "jvm_analysis": {},
         "config_analysis": {},
+        "parsed_configs": {},
         "recommendations": [],
     }
 
-    if not jvm_flags_str:
-        result["jvm_analysis"] = {"status": "NO_DATA", "detail": "JVM flags not found in profile. Use /spark profiler start --comment \"flags\" or check startup script."}
-        return result
-
-    flags = jvm_flags_str if isinstance(jvm_flags_str, list) else jvm_flags_str.split()
-    flags_str = " ".join(flags) if isinstance(flags, list) else jvm_flags_str
-
-    def has_flag(pattern):
-        return bool(re.search(pattern, flags_str, re.IGNORECASE))
-
-    result["jvm_analysis"]["raw_flags"] = flags_str
-
-    xmx_match = re.search(r"-Xmx(\d+)([gGmMkK]?)", flags_str)
-    xms_match = re.search(r"-Xms(\d+)([gGmMkK]?)", flags_str)
-    if xmx_match:
-        xmx_val = int(xmx_match.group(1))
-        xmx_unit = xmx_match.group(2).upper() or "M"
-        result["jvm_analysis"]["heap_max"] = f"{xmx_val}{xmx_unit}"
-    if xms_match:
-        xms_val = int(xms_match.group(1))
-        xms_unit = xms_match.group(2).upper() or "M"
-        result["jvm_analysis"]["heap_init"] = f"{xms_val}{xms_unit}"
-    if xmx_match and xms_match:
-        if xms_val != xmx_val or xms_match.group(2).upper() != xmx_match.group(2).upper():
-            result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "-Xms and -Xmx should be equal to prevent heap fragmentation.", "action": f"Set both to -Xms{xmx_val}{xmx_unit} -Xmx{xmx_val}{xmx_unit}"})
-
-    gc_detected = None
-    if has_flag(r"UseZGC|ZGarbageCollector"):
-        gc_detected = "ZGC"
-    elif has_flag(r"UseG1GC"):
-        gc_detected = "G1GC"
-    elif has_flag(r"UseParallelGC|UseParallelOldGC"):
-        gc_detected = "Parallel"
-    elif has_flag(r"UseConcMarkSweepGC|UseCMS"):
-        gc_detected = "CMS"
-    result["jvm_analysis"]["detected_gc"] = gc_detected
-
-    if gc_detected == "Parallel":
-        result["recommendations"].append({"severity": "CRITICAL", "category": "gc", "detail": "Parallel GC causes STW pauses. Switch to G1GC (Aikar's flags) for Minecraft.", "action": "Use G1GC or ZGC instead. See jvm-gc-tuning.md reference."})
-    elif gc_detected == "CMS":
-        result["recommendations"].append({"severity": "CRITICAL", "category": "gc", "detail": "CMS GC is deprecated and unsuitable for Minecraft. Switch to G1GC or ZGC.", "action": "Use G1GC with Aikar's flags or ZGC for large heaps (>30GB)."})
-
-    if gc_detected == "G1GC":
-        aikar_flags = {
-            "G1NewSizePercent": "40",
-            "G1ReservePercent": "20",
-            "MaxGCPauseMillis": "200",
-            "G1HeapRegionSize": None,
-            "MaxTenuringThreshold": "1",
-            "SurvivorRatio": "32",
-            "G1MixedGCCountTarget": "4",
-            "G1MixedGCLiveThresholdPercent": "90",
-            "G1RSetUpdatingPauseTimePercent": "5",
+    config_dir = getattr(args, 'config_dir', None)
+    config_files = {}
+    if config_dir:
+        config_dir = os.path.expanduser(config_dir)
+        file_map = {
+            "server_properties": ["server.properties"],
+            "spigot": ["spigot.yml"],
+            "bukkit": ["bukkit.yml"],
+            "paper_global": ["paper-global.yml", "config/paper-global.yml"],
+            "paper_world": ["paper-world.yml", "paper-world-defaults.yml", "config/paper-world-defaults.yml"],
+            "paper_world_nether": ["world_nether/paper-world.yml", "world_nether/paper-world-defaults.yml"],
+            "paper_world_end": ["world_the_end/paper-world.yml", "world_the_end/paper-world-defaults.yml"],
+            "canvas_config": ["canvas-server.json5", "config/canvas-server.json5", "canvas-config.json5"],
+            "velocity_config": ["velocity.toml", "config/velocity.toml"],
+            "bungee_config": ["config.yml", "BungeeCord/config.yml"],
+            "pufferfish_config": ["pufferfish.yml", "config/pufferfish.yml"],
+            "purpur_config": ["purpur.yml", "config/purpur.yml"],
         }
-        missing = []
-        for flag, expected in aikar_flags.items():
-            if not has_flag(flag):
-                missing.append(flag)
-        if missing:
-            result["recommendations"].append({"severity": "WARNING", "category": "gc_tuning", "detail": f"Missing Aikar's G1GC flags: {', '.join(missing)}", "action": "Add these flags for optimal G1GC performance. See jvm-gc-tuning.md reference."})
+        for key, names in file_map.items():
+            for name in names:
+                fpath = os.path.join(config_dir, name)
+                if os.path.isfile(fpath):
+                    parsed = _load_config_file(fpath)
+                    if parsed:
+                        config_files[key] = parsed
+                        break
 
-        if xmx_match:
-            heap_gb = xmx_val if xmx_match.group(2).upper() == "G" else xmx_val / 1024
-            if heap_gb >= 12 and not has_flag(r"G1HeapRegionSize"):
-                result["recommendations"].append({"severity": "CRITICAL", "category": "gc_tuning", "detail": f"Missing -XX:G1HeapRegionSize for {heap_gb}GB heap. Critical for preventing humongous objects.", "action": f"Set -XX:G1HeapRegionSize={8 if heap_gb < 32 else 16}M"})
+    sp_path = getattr(args, 'server_properties', None)
+    spigot_path = getattr(args, 'spigot_yml', None)
+    bukkit_path = getattr(args, 'bukkit_yml', None)
+    pg_path = getattr(args, 'paper_global_yml', None)
+    pw_path = getattr(args, 'paper_world_yml', None)
+    canvas_path = getattr(args, 'canvas_config', None)
+    velocity_path = getattr(args, 'velocity_config', None)
+    pufferfish_path = getattr(args, 'pufferfish_config', None)
+    purpur_path = getattr(args, 'purpur_config', None)
 
-    if gc_detected == "ZGC":
-        zgc_flags = ["ZUncommit", "AlwaysPreTouch", "ParallelRefProcEnabled", "UseLargePages"]
-        for flag in zgc_flags:
-            neg_flag = f"-XX:-{flag}"
-            pos_flag = f"-XX:+{flag}"
-            if pos_flag in flags_str:
+    if sp_path and os.path.isfile(sp_path):
+        parsed = _load_config_file(sp_path)
+        if parsed:
+            config_files["server_properties"] = parsed
+    if spigot_path and os.path.isfile(spigot_path):
+        parsed = _load_config_file(spigot_path)
+        if parsed:
+            config_files["spigot"] = parsed
+    if bukkit_path and os.path.isfile(bukkit_path):
+        parsed = _load_config_file(bukkit_path)
+        if parsed:
+            config_files["bukkit"] = parsed
+    if pg_path and os.path.isfile(pg_path):
+        parsed = _load_config_file(pg_path)
+        if parsed:
+            config_files["paper_global"] = parsed
+    if pw_path and os.path.isfile(pw_path):
+        parsed = _load_config_file(pw_path)
+        if parsed:
+            config_files["paper_world"] = parsed
+    if canvas_path and os.path.isfile(canvas_path):
+        parsed = _load_config_file(canvas_path)
+        if parsed:
+            config_files["canvas_config"] = parsed
+    if velocity_path and os.path.isfile(velocity_path):
+        parsed = _load_config_file(velocity_path)
+        if parsed:
+            config_files["velocity_config"] = parsed
+    if pufferfish_path and os.path.isfile(pufferfish_path):
+        parsed = _load_config_file(pufferfish_path)
+        if parsed:
+            config_files["pufferfish_config"] = parsed
+    if purpur_path and os.path.isfile(purpur_path):
+        parsed = _load_config_file(purpur_path)
+        if parsed:
+            config_files["purpur_config"] = parsed
+
+    for key in ("server_properties", "server.properties", "spigot", "spigot.yml", "bukkit", "bukkit.yml", "paper_global", "paper-global.yml", "paper_world", "paper-world.yml", "paper-world-defaults.yml", "canvas_config", "canvas-server.json5", "velocity_config", "velocity.toml", "pufferfish_config", "pufferfish.yml", "purpur_config", "purpur.yml"):
+        cfg_val = configs.get(key)
+        if cfg_val and key not in config_files and key.replace(".", "_").replace("-", "_") not in config_files:
+            try:
+                if isinstance(cfg_val, str) and cfg_val.strip().startswith(("{", "[")):
+                    try:
+                        parsed_val = json.loads(cfg_val)
+                    except (json.JSONDecodeError, ValueError):
+                        parsed_val = _parse_json5(cfg_val)
+                elif isinstance(cfg_val, str):
+                    if key in ("server.properties", "server_properties"):
+                        parsed_val = _parse_server_properties(cfg_val) if "=" in cfg_val else None
+                    else:
+                        parsed_val = _parse_simple_yaml(cfg_val)
+                elif isinstance(cfg_val, dict):
+                    parsed_val = cfg_val
+                else:
+                    parsed_val = None
+                if parsed_val:
+                    normalized_key = key.replace(".", "_").replace("-", "_").replace("/", "_").rstrip("_")
+                    if "server_properties" in normalized_key or normalized_key == "server_properties":
+                        config_files.setdefault("server_properties", parsed_val)
+                    elif normalized_key in ("spigot", "spigot_yml"):
+                        config_files.setdefault("spigot", parsed_val)
+                    elif normalized_key in ("bukkit", "bukkit_yml"):
+                        config_files.setdefault("bukkit", parsed_val)
+                    elif normalized_key in ("paper_global", "paper_global_yml"):
+                        config_files.setdefault("paper_global", parsed_val)
+                    elif normalized_key in ("paper_world", "paper_world_yml", "paper_world_defaults_yml"):
+                        config_files.setdefault("paper_world", parsed_val)
+                    elif normalized_key in ("canvas_config", "canvas_server_json5"):
+                        config_files.setdefault("canvas_config", parsed_val)
+                    elif normalized_key in ("velocity_config", "velocity_toml"):
+                        config_files.setdefault("velocity_config", parsed_val)
+                    elif normalized_key in ("pufferfish_config", "pufferfish_yml"):
+                        config_files.setdefault("pufferfish_config", parsed_val)
+                    elif normalized_key in ("purpur_config", "purpur_yml"):
+                        config_files.setdefault("purpur_config", parsed_val)
+                    else:
+                        config_files[normalized_key] = parsed_val
+            except (json.JSONDecodeError, ValueError):
                 pass
-            elif neg_flag in flags_str and flag == "ZUncommit":
-                result["recommendations"].append({"severity": "INFO", "category": "zgc", "detail": "ZUncommit is disabled, which is recommended for Minecraft.", "action": "Keep -XX:-ZUncommit to prevent heap shrinking."})
-        if not has_flag(r"AlwaysPreTouch"):
-            result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "Missing -XX:+AlwaysPreTouch. Pre-touching heap pages improves startup consistency.", "action": "Add -XX:+AlwaysPreTouch"})
-        if not has_flag(r"ParallelRefProcEnabled"):
-            result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "Consider -XX:+ParallelRefProcEnabled for parallel reference processing.", "action": "Add -XX:+ParallelRefProcEnabled"})
 
-    if not has_flag(r"DisableExplicitGC"):
-        result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "Missing -XX:+DisableExplicitGC. Plugins can trigger full GC causing lag spikes.", "action": "Add -XX:+DisableExplicitGC unless you specifically need System.gc() calls."})
+    for raw_key, raw_val in configs.items():
+        if raw_val and raw_key not in configs:
+            continue
+        key = raw_key
+        val = raw_val
+        if key in config_files or key.replace(".", "_").replace("-", "_").replace("/", "_").rstrip("_") in config_files:
+            continue
+        try:
+            if isinstance(val, str) and val.strip().startswith(("{", "[")):
+                try:
+                    parsed_val = json.loads(val)
+                except (json.JSONDecodeError, ValueError):
+                    parsed_val = _parse_json5(val)
+            elif isinstance(val, str):
+                parsed_val = _parse_simple_yaml(val)
+            elif isinstance(val, dict):
+                parsed_val = val
+            else:
+                continue
+            if not parsed_val:
+                continue
+            normalized = key.replace(".", "_").replace("-", "_").replace("/", "_").rstrip("_")
+            if "server_properties" in normalized or normalized == "server_properties":
+                config_files.setdefault("server_properties", parsed_val)
+            elif normalized in ("spigot", "spigot_yml"):
+                config_files.setdefault("spigot", parsed_val)
+            elif normalized in ("bukkit", "bukkit_yml"):
+                config_files.setdefault("bukkit", parsed_val)
+            elif "paper_global" in normalized or "paper_global_yml" in normalized:
+                config_files.setdefault("paper_global", parsed_val)
+            elif "paper_world" in normalized or "paper_world_defaults" in normalized:
+                config_files.setdefault("paper_world", parsed_val)
+            elif "canvas" in normalized:
+                config_files.setdefault("canvas_config", parsed_val)
+            elif "velocity" in normalized:
+                config_files.setdefault("velocity_config", parsed_val)
+            elif "pufferfish" in normalized:
+                config_files.setdefault("pufferfish_config", parsed_val)
+            elif "purpur" in normalized:
+                config_files.setdefault("purpur_config", parsed_val)
+            else:
+                config_files[key] = parsed_val
+        except (json.JSONDecodeError, ValueError):
+            pass
 
-    if has_flag(r"UseStringDeduplication") and gc_detected == "ZGC":
-        result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "String deduplication enabled with ZGC - this reduces memory for duplicate strings.", "action": "Keep this flag for memory optimization."})
+    result["parsed_configs"] = config_files
 
-    if has_flag(r"UseNUMA"):
-        result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "NUMA awareness enabled. Good for multi-socket systems.", "action": "Keep -XX:+UseNUMA if on multi-socket hardware."})
+    gamemode_arg = getattr(args, 'gamemode', None)
+    if gamemode_arg:
+        gamemode = gamemode_arg
+        result["gamemode"] = gamemode
+        result["gamemode_source"] = "user_specified"
+    else:
+        gamemode = _detect_gamemode(data, meta, platform)
+        result["gamemode"] = gamemode
+        result["gamemode_source"] = "auto_detected"
+    platform_type = "paper" if "paper" in server_name else ("folia" if "folia" in server_name else ("canvas" if "canvas" in server_name else ("spigot" if "spigot" in server_name else "bukkit")))
 
-    if not has_flag(r"MaxInlineLevel") and "velocity" in server_name:
-        result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "For Velocity proxy, consider -XX:MaxInlineLevel=15 for better JIT optimization.", "action": "Add -XX:MaxInlineLevel=15 to startup flags."})
+    if config_files:
+        config_findings = _analyze_configs(config_files, gamemode, platform_type)
+        result["config_analysis"] = {
+            "files_parsed": list(config_files.keys()),
+            "findings_count": len(config_findings),
+        }
+        result["recommendations"].extend(config_findings)
 
-    result["config_analysis"] = {k: v for k, v in configs.items() if k not in ("jvm_args", "flags") and v}
+    if not jvm_flags_str:
+        result["jvm_analysis"] = {"status": "NO_DATA", "detail": "JVM flags not found in profile. Provide --config-dir or check startup script."}
+    else:
+        flags = jvm_flags_str if isinstance(jvm_flags_str, list) else jvm_flags_str.split()
+        flags_str = " ".join(flags) if isinstance(flags, list) else jvm_flags_str
+
+        def has_flag(pattern):
+            return bool(re.search(pattern, flags_str, re.IGNORECASE))
+
+        result["jvm_analysis"]["raw_flags"] = flags_str
+
+        xmx_match = re.search(r"-Xmx(\d+)([gGmMkK]?)", flags_str)
+        xms_match = re.search(r"-Xms(\d+)([gGmMkK]?)", flags_str)
+        if xmx_match:
+            xmx_val = int(xmx_match.group(1))
+            xmx_unit = xmx_match.group(2).upper() or "M"
+            result["jvm_analysis"]["heap_max"] = f"{xmx_val}{xmx_unit}"
+        if xms_match:
+            xms_val = int(xms_match.group(1))
+            xms_unit = xms_match.group(2).upper() or "M"
+            result["jvm_analysis"]["heap_init"] = f"{xms_val}{xms_unit}"
+        if xmx_match and xms_match:
+            if xms_val != xmx_val or xms_match.group(2).upper() != xmx_match.group(2).upper():
+                result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "-Xms and -Xmx should be equal to prevent heap fragmentation.", "action": f"Set both to -Xms{xmx_val}{xmx_unit} -Xmx{xmx_val}{xmx_unit}"})
+
+        gc_detected = None
+        if has_flag(r"UseZGC|ZGarbageCollector"):
+            gc_detected = "ZGC"
+        elif has_flag(r"UseG1GC"):
+            gc_detected = "G1GC"
+        elif has_flag(r"UseParallelGC|UseParallelOldGC"):
+            gc_detected = "Parallel"
+        elif has_flag(r"UseConcMarkSweepGC|UseCMS"):
+            gc_detected = "CMS"
+        result["jvm_analysis"]["detected_gc"] = gc_detected
+
+        if gc_detected == "Parallel":
+            result["recommendations"].append({"severity": "CRITICAL", "category": "gc", "detail": "Parallel GC causes STW pauses. Switch to G1GC (Aikar's flags) for Minecraft.", "action": "Use G1GC or ZGC instead. See jvm-gc-tuning.md reference."})
+        elif gc_detected == "CMS":
+            result["recommendations"].append({"severity": "CRITICAL", "category": "gc", "detail": "CMS GC is deprecated and unsuitable for Minecraft. Switch to G1GC or ZGC.", "action": "Use G1GC with Aikar's flags or ZGC for large heaps (>30GB)."})
+
+        if gc_detected == "G1GC":
+            aikar_flags = {
+                "G1NewSizePercent": "40",
+                "G1ReservePercent": "20",
+                "MaxGCPauseMillis": "200",
+                "G1HeapRegionSize": None,
+                "MaxTenuringThreshold": "1",
+                "SurvivorRatio": "32",
+                "G1MixedGCCountTarget": "4",
+                "G1MixedGCLiveThresholdPercent": "90",
+                "G1RSetUpdatingPauseTimePercent": "5",
+            }
+            missing = []
+            for flag, expected in aikar_flags.items():
+                if not has_flag(flag):
+                    missing.append(flag)
+            if missing:
+                result["recommendations"].append({"severity": "WARNING", "category": "gc_tuning", "detail": f"Missing Aikar's G1GC flags: {', '.join(missing)}", "action": "Add these flags for optimal G1GC performance. See jvm-gc-tuning.md reference."})
+
+            if xmx_match:
+                heap_gb = xmx_val if xmx_match.group(2).upper() == "G" else xmx_val / 1024
+                if heap_gb >= 12 and not has_flag(r"G1HeapRegionSize"):
+                    result["recommendations"].append({"severity": "CRITICAL", "category": "gc_tuning", "detail": f"Missing -XX:G1HeapRegionSize for {heap_gb}GB heap. Critical for preventing humongous objects.", "action": f"Set -XX:G1HeapRegionSize={8 if heap_gb < 32 else 16}M"})
+
+        if gc_detected == "ZGC":
+            zgc_flags = ["ZUncommit", "AlwaysPreTouch", "ParallelRefProcEnabled", "UseLargePages"]
+            for flag in zgc_flags:
+                neg_flag = f"-XX:-{flag}"
+                pos_flag = f"-XX:+{flag}"
+                if pos_flag in flags_str:
+                    pass
+                elif neg_flag in flags_str and flag == "ZUncommit":
+                    result["recommendations"].append({"severity": "INFO", "category": "zgc", "detail": "ZUncommit is disabled, which is recommended for Minecraft.", "action": "Keep -XX:-ZUncommit to prevent heap shrinking."})
+            if not has_flag(r"AlwaysPreTouch"):
+                result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "Missing -XX:+AlwaysPreTouch. Pre-touching heap pages improves startup consistency.", "action": "Add -XX:+AlwaysPreTouch"})
+            if not has_flag(r"ParallelRefProcEnabled"):
+                result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "Consider -XX:+ParallelRefProcEnabled for parallel reference processing.", "action": "Add -XX:+ParallelRefProcEnabled"})
+
+        if not has_flag(r"DisableExplicitGC"):
+            result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "Missing -XX:+DisableExplicitGC. Plugins can trigger full GC causing lag spikes.", "action": "Add -XX:+DisableExplicitGC unless you specifically need System.gc() calls."})
+
+        if has_flag(r"UseStringDeduplication") and gc_detected == "ZGC":
+            result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "String deduplication enabled with ZGC - this reduces memory for duplicate strings.", "action": "Keep this flag for memory optimization."})
+
+        if has_flag(r"UseNUMA"):
+            result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "NUMA awareness enabled. Good for multi-socket systems.", "action": "Keep -XX:+UseNUMA if on multi-socket hardware."})
+
+        if not has_flag(r"MaxInlineLevel") and "velocity" in server_name:
+            result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "For Velocity proxy, consider -XX:MaxInlineLevel=15 for better JIT optimization.", "action": "Add -XX:MaxInlineLevel=15 to startup flags."})
+
+        if has_flag(r"ActiveProcessorCount"):
+            apc_match = re.search(r"-XX:ActiveProcessorCount=(\d+)", flags_str)
+            if apc_match:
+                apc_val = int(apc_match.group(1))
+                cpu_threads = sstats.get("cpu", {}).get("threads", 0) if sstats.get("cpu", {}).get("threads") else 0
+                result["jvm_analysis"]["active_processor_count"] = apc_val
+                if cpu_threads and apc_val != cpu_threads:
+                    result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": f"ActiveProcessorCount={apc_val} overrides detected CPU thread count ({cpu_threads}). This limits JVM thread pools to {apc_val} threads.", "action": f"Set ActiveProcessorCount to match your actual core count ({cpu_threads}) unless you are intentionally capping for shared hosting."})
+                elif not cpu_threads:
+                    result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": f"ActiveProcessorCount={apc_val} is set. Verify this matches your actual physical/vCPU core count for optimal thread pool sizing.", "action": "Ensure ActiveProcessorCount matches your CPU core count."})
+
+        if has_flag(r"UnlockDiagnosticVMOptions"):
+            result["jvm_analysis"]["unlock_diagnostic"] = True
+
+        if has_flag(r"UnlockExperimentalVMOptions"):
+            result["jvm_analysis"]["unlock_experimental"] = True
+
+        if has_flag(r"UseAVX"):
+            avx_match = re.search(r"-XX:UseAVX=(\d+)", flags_str)
+            if avx_match:
+                avx_val = int(avx_match.group(1))
+                result["jvm_analysis"]["use_avx"] = avx_val
+                if avx_val >= 3:
+                    result["recommendations"].append({"severity": "LOW", "category": "jvm", "detail": f"UseAVX={avx_val} requires CPU support for AVX-{avx_val}. Older CPUs may crash with UnsupportedHardwareException.", "action": "Verify your CPU supports AVX-{avx_val}. Most modern CPUs support AVX2 (2), fewer support AVX-512 (3). Use AVX=2 for broader compatibility."})
+
+        if has_flag(r"UseCompactObjectHeaders"):
+            result["jvm_analysis"]["compact_object_headers"] = True
+            if gc_detected == "G1GC":
+                result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "UseCompactObjectHeaders is enabled with G1GC. This is an experimental flag that can reduce memory but may cause compatibility issues with some JVM versions.", "action": "Test thoroughly. Remove if you experience crashes or unexpected behavior."})
+
+        if has_flag(r"UseTransparentHugePages"):
+            result["jvm_analysis"]["transparent_huge_pages"] = True
+            if "linux" not in sstats.get("os", {}).get("name", "").lower():
+                result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": "UseTransparentHugePages is enabled but the OS may not be Linux. THP behavior differs on Windows/macOS.", "action": "Remove UseTransparentHugePages if not on Linux. On Linux, ensure system THP is configured (madvise mode recommended)."})
+
+        if has_flag(r"AlwaysPreTouchStacks"):
+            result["jvm_analysis"]["always_pretouch_stacks"] = True
+            result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "AlwaysPreTouchStacks pre-touches thread stacks at creation. Improves startup consistency but increases memory usage per thread.", "action": "Keep if startup consistency is important. Remove if memory is tight."})
+
+        if has_flag(r"UseStringDeduplication") and gc_detected != "ZGC":
+            result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "UseStringDeduplication is enabled with " + (gc_detected or "unknown GC") + ". Most effective with G1GC. Can slightly increase GC pause times.", "action": "Keep for memory optimization. Monitor GC pause times."})
+
+        soft_ref_match = re.search(r"-XX:SoftRefLRUPolicyMSPerMB=(\d+)", flags_str)
+        if soft_ref_match:
+            sru_val = int(soft_ref_match.group(1))
+            result["jvm_analysis"]["soft_ref_lru"] = sru_val
+            if sru_val < 1000:
+                result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": f"SoftRefLRUPolicyMSPerMB={sru_val} is very low. Soft references will be cleared aggressively, which can break caches (like LevelDB cache, plugin caches).", "action": "Set to 1000-2000 for Minecraft servers. The default is 1000."})
+            elif sru_val > 10000:
+                result["recommendations"].append({"severity": "LOW", "category": "jvm", "detail": f"SoftRefLRUPolicyMSPerMB={sru_val} is very high. Soft references will persist much longer, potentially causing memory pressure.", "action": "Consider 1000-2000. Current value means soft refs survive {sru_val}ms per MB of heap."})
+
+        if has_flag(r"AlwaysActAsServerClassMachine"):
+            result["jvm_analysis"]["server_class_machine"] = True
+
+        ci_count_match = re.search(r"-XX:CICompilerCount=(\d+)", flags_str)
+        if ci_count_match:
+            ci_val = int(ci_count_match.group(1))
+            result["jvm_analysis"]["ci_compiler_count"] = ci_val
+            cpu_threads = sstats.get("cpu", {}).get("threads", 0)
+            if cpu_threads and ci_val > cpu_threads:
+                result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": f"CICompilerCount={ci_val} exceeds CPU threads ({cpu_threads}). Extra compiler threads will compete for CPU without benefit.", "action": f"Set CICompilerCount to {max(2, min(8, cpu_threads // 2))} for {cpu_threads} cores."})
+            elif cpu_threads and ci_val < 2:
+                result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": f"CICompilerCount={ci_val} is too low. JVM JIT compilation will be slow, causing longer warmup and lower peak performance.", "action": "Set CICompilerCount to at least 2. Recommended: 4-8 for most servers."})
+
+        if has_flag(r"UseCriticalCompilerThreadPriority"):
+            result["jvm_analysis"]["critical_compiler_thread_priority"] = True
+
+        if has_flag(r"UseCriticalJavaThreadPriority"):
+            result["jvm_analysis"]["critical_java_thread_priority"] = True
+            result["recommendations"].append({"severity": "INFO", "category": "jvm", "detail": "UseCriticalJavaThreadPriority increases Java thread priority. On most Linux systems this has no effect unless you run as root.", "action": "Keep if on Windows or running as root on Linux. Otherwise it has no effect."})
+
+        if has_flag(r"SegmentedCodeCache"):
+            result["jvm_analysis"]["segmented_code_cache"] = True
+            reserved_match = re.search(r"-XX:ReservedCodeCacheSize=(\d+)([gGmMkK]?)", flags_str)
+            non_prof_match = re.search(r"-XX:NonProfiledCodeHeapSize=(\d+)([gGmMkK]?)", flags_str)
+            prof_match = re.search(r"-XX:ProfiledCodeHeapSize=(\d+)([gGmMkK]?)", flags_str)
+            if reserved_match:
+                rc_val = int(reserved_match.group(1))
+                rc_unit = (reserved_match.group(2) or "M").upper()
+                result["jvm_analysis"]["reserved_code_cache"] = f"{rc_val}{rc_unit}"
+                if rc_val > 1500 and rc_unit == "M":
+                    result["recommendations"].append({"severity": "LOW", "category": "jvm", "detail": f"ReservedCodeCacheSize={rc_val}{rc_unit} is very large. This reserves {rc_val}MB of memory for JIT compiled code.", "action": "512-784MB is typically sufficient for Minecraft. Reduce unless you see 'CodeCache is full' errors."})
+            if non_prof_match and reserved_match:
+                np_val = int(non_prof_match.group(1))
+                prof_val = int(prof_match.group(1)) if prof_match else 0
+                total_segmented = np_val + prof_val
+                rc_val_num = int(reserved_match.group(1))
+                if total_segmented > rc_val_num * 0.9:
+                    result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": f"NonProfiledCodeHeapSize ({np_val}M) + ProfiledCodeHeapSize ({prof_val}M) = {total_segmented}M, which is close to or exceeds ReservedCodeCacheSize ({rc_val_num}M). The JVM needs ~15% headroom.", "action": f"Increase ReservedCodeCacheSize or decrease the segment sizes."})
+
+        if has_flag(r"DontCompileHugeMethods") and "-XX:-DontCompileHugeMethods" in flags_str:
+            result["jvm_analysis"]["dont_compile_huge_methods"] = False
+        elif has_flag(r"DontCompileHugeMethods"):
+            result["jvm_analysis"]["dont_compile_huge_methods"] = True
+
+        inline_level = re.search(r"-XX:MaxInlineLevel=(\d+)", flags_str)
+        if inline_level:
+            il_val = int(inline_level.group(1))
+            result["jvm_analysis"]["max_inline_level"] = il_val
+            if il_val > 20:
+                result["recommendations"].append({"severity": "WARNING", "category": "jvm", "detail": f"MaxInlineLevel={il_val} is above the default (9) and even above the common tuned value (20). Very high inline levels cause JIT to spend more time compiling and can increase code cache usage.", "action": "Use 15-20 for balanced performance. Values above 20 rarely help and may hurt."})
+
+        inline_size = re.search(r"-XX:MaxInlineSize=(\d+)", flags_str)
+        if inline_size:
+            is_val = int(inline_size.group(1))
+            result["jvm_analysis"]["max_inline_size"] = is_val
+            if is_val > 300:
+                result["recommendations"].append({"severity": "LOW", "category": "jvm", "detail": f"MaxInlineSize={is_val} is very high (default: 35). This allows the JIT to inline larger methods, increasing compiled code size.", "action": "Use 200-270 for tuned servers. Higher values increase code cache pressure."})
+
+        freq_inline = re.search(r"-XX:FreqInlineSize=(\d+)", flags_str)
+        if freq_inline:
+            fi_val = int(freq_inline.group(1))
+            result["jvm_analysis"]["freq_inline_size"] = fi_val
+            if fi_val > 3000:
+                result["recommendations"].append({"severity": "LOW", "category": "jvm", "detail": f"FreqInlineSize={fi_val} is very high (default: 325). This allows very hot methods to be inlined regardless of size.", "action": "Acceptable for tuned servers. Monitor code cache usage."})
+
+        inline_small = re.search(r"-XX:InlineSmallCode=(\d+)", flags_str)
+        if inline_small:
+            isc_val = int(inline_small.group(1))
+            result["jvm_analysis"]["inline_small_code"] = isc_val
+
+        loop_unroll = re.search(r"-XX:LoopUnrollLimit=(\d+)", flags_str)
+        if loop_unroll:
+            lu_val = int(loop_unroll.group(1))
+            result["jvm_analysis"]["loop_unroll_limit"] = lu_val
+
+        autobox = re.search(r"-XX:AutoBoxCacheMax=(\d+)", flags_str)
+        if autobox:
+            ab_val = int(autobox.group(1))
+            result["jvm_analysis"]["auto_box_cache_max"] = ab_val
+            if ab_val > 20000:
+                result["recommendations"].append({"severity": "LOW", "category": "jvm", "detail": f"AutoBoxCacheMax={ab_val} caches Integer values up to {ab_val}. Default is 128. High values increase memory usage slightly.", "action": "10000-20000 is reasonable for servers with heavy Integer usage. Keep if you've measured a benefit."})
+
+        if has_flag(r"UseFMA"):
+            result["jvm_analysis"]["use_fma"] = True
+
+        if has_flag(r"UseCMoveUnconditionally"):
+            result["jvm_analysis"]["use_cmove"] = True
+
+        if has_flag(r"UseSuperWord"):
+            result["jvm_analysis"]["use_superword"] = True
+
+        if has_flag(r"UseVectorMacroLogic"):
+            result["jvm_analysis"]["use_vector_macro_logic"] = True
+
+        systemd_props = re.findall(r"-D([a-zA-Z0-9_.-]+)=(\S+)", flags_str)
+        for prop_name, prop_val in systemd_props:
+            if prop_name == "log4j2.formatMsgNoLookups":
+                result["jvm_analysis"]["log4j_fix"] = True
+            elif prop_name == "java.security.egd" and "dev/urandom" in prop_val:
+                result["jvm_analysis"]["egd_urandom"] = True
+            elif prop_name == "file.encoding":
+                result["jvm_analysis"]["file_encoding"] = prop_val
+
+        result["config_analysis"] = {k: v for k, v in configs.items() if k not in ("jvm_args", "flags") and v}
 
     return result
 
@@ -2341,8 +3133,19 @@ def build_parser():
     sub.add_parser("recommend", parents=[common], help="Comprehensive performance recommendations with priority actions")
 
     # check-config
-    p_check = sub.add_parser("check-config", parents=[common], help="Analyze JVM flags and server configuration for performance issues")
+    p_check = sub.add_parser("check-config", parents=[common], help="Analyze JVM flags and server configuration files for performance issues and gamemode-specific safety")
     p_check.add_argument("--platform", choices=["paper", "folia", "spigot", "bukkit", "velocity", "bungee"], help="Server platform for config-specific checks")
+    p_check.add_argument("--gamemode", choices=["smp", "lobby", "bedwars", "skyblock", "factions", "creative", "modded", "unknown"], default=None, help="Server gamemode for gamemode-aware config review. Default: auto-detect from plugins, fallback to 'unknown' (conservative)")
+    p_check.add_argument("--config-dir", help="Path to server directory containing server.properties, spigot.yml, bukkit.yml, paper-global.yml, paper-world.yml")
+    p_check.add_argument("--server-properties", help="Path to server.properties file")
+    p_check.add_argument("--spigot-yml", help="Path to spigot.yml file")
+    p_check.add_argument("--bukkit-yml", help="Path to bukkit.yml file")
+    p_check.add_argument("--paper-global-yml", help="Path to paper-global.yml file")
+    p_check.add_argument("--paper-world-yml", help="Path to paper-world.yml or paper-world-defaults.yml file")
+    p_check.add_argument("--canvas-config", help="Path to canvas-server.json5 file")
+    p_check.add_argument("--velocity-config", help="Path to velocity.toml file")
+    p_check.add_argument("--pufferfish-config", help="Path to pufferfish.yml file")
+    p_check.add_argument("--purpur-config", help="Path to purpur.yml file")
 
     return parser
 

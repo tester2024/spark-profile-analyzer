@@ -446,19 +446,64 @@ From spark profile `info` command, determine:
 3. Plugin list (identifies gamemode plugins like Bedwars, Skyblock, etc.)
 4. Player count patterns
 
-### Step 2: Get Current Configuration
+**Supported config file formats:**
+- `server.properties` - Java properties (key=value)
+- `.yml` files - YAML (spigot.yml, bukkit.yml, paper-global.yml, paper-world.yml, pufferfish.yml, purpur.yml)
+- `.json` files - Standard JSON
+- `.json5` files - JSON5 with comments and trailing commas (canvas-server.json5)
+- `.toml` files - TOML (velocity.toml)
 
-Ask the user for their current config files:
-- `server.properties`
-- `spigot.yml`
-- `paper-global.yml` (if Paper)
-- `paper-world.yml` or `paper-world-defaults.yml` (if Paper)
-- `bukkit.yml`
-- Startup script (for JVM flags)
+**Auto-discovery from `--config-dir`:** Scans for `server.properties`, `spigot.yml`, `bukkit.yml`, `paper-global.yml`, `paper-world.yml`, `paper-world-defaults.yml`, `canvas-server.json5`, `velocity.toml`, `pufferfish.yml`, `purpur.yml`, and per-world Paper configs (`world_nether/paper-world.yml`, `world_the_end/paper-world.yml`).
 
-Or extract from spark data where possible.
+**Profile data:** Spark profiles automatically contain `server.properties`, `spigot.yml`, `bukkit.yml`, and Paper/Canvas configs embedded in the profile data - no local files needed if the server was profiled with spark.
 
-### Step 3: Systematic Review
+### Step 2: Run check-config
+
+Use the `check-config` command to automatically parse and analyze server configuration:
+
+```bash
+# From spark profile data only (configs embedded in profile)
+python spark_toolkit.py check-config https://spark.lucko.me/abc123 --gamemode smp
+
+# With local config directory
+python spark_toolkit.py check-config https://spark.lucko.me/abc123 --gamemode smp --config-dir /path/to/server/
+
+# With individual config files
+python spark_toolkit.py check-config https://spark.lucko.me/abc123 --gamemode bedwars \
+  --server-properties server.properties \
+  --spigot-yml spigot.yml \
+  --bukkit-yml bukkit.yml \
+  --paper-global-yml paper-global.yml \
+  --paper-world-yml paper-world-defaults.yml
+```
+
+**Gamemode options**: `smp`, `lobby`, `bedwars`, `skyblock`, `factions`, `creative`, `modded`
+
+The command automatically:
+- Parses `server.properties`, `spigot.yml`, `bukkit.yml`, `paper-global.yml`, `paper-world.yml` from profile data or local files
+- Checks JVM flags (GC type, heap sizing, Aikar's flags, bad flags)
+- Analyzes game configs against gamemode-specific safety rules
+- Checks config dependencies (mob-spawn-range vs simulation-distance, etc.)
+- Flags bug-configs (hopper-transfer=1, max-entity-collisions<3, etc.)
+- Returns severity-labeled findings: CRITICAL, WARNING, LOW, INFO
+
+### Step 3: Cross-Reference with Spark Data
+
+Combine `check-config` findings with spark performance data:
+- `tps` - TPS/MSPT health confirms whether config issues are actually causing lag
+- `entities` - High entity count validates spawn-limits findings
+- `hotspots` --exclude-sleep - Identifies which config changes would have the most impact
+- `plugins` - Plugin-specific lag may override config issues
+
+### Step 3: Cross-Reference with Spark Data
+
+Combine `check-config` findings with spark performance data:
+- `tps` - TPS/MSPT health confirms whether config issues are actually causing lag
+- `entities` - High entity count validates spawn-limits findings
+- `hotspots` --exclude-sleep - Identifies which config changes would have the most impact
+- `plugins` - Plugin-specific lag may override config issues
+
+### Step 4: Systematic Review
 
 Review each config against the gamemode profile. For each setting:
 

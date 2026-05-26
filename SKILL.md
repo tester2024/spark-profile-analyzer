@@ -52,6 +52,7 @@ All analysis goes through `scripts/spark_toolkit.py`. Every command outputs stru
 | `callpath` | Trace call path to a method | Understand how a hotspot is reached |
 | `gc` | GC statistics with health status | Detect GC pauses causing lag spikes |
 | `heap` | Heap summary with plugin attribution | Find what's using memory |
+| `check-config` | Analyze JVM flags + server config files with gamemode-aware safety checks | **Config review**; finds bug-configs, dependency issues, and gameplay-breaking settings |
 | `plugin-heap` | Heap attributed to one plugin | Check a specific plugin's memory usage |
 | `plugin-profile` | Complete plugin perf profile (CPU+heap+findings) | Deep-dive on one plugin |
 | `entities` | Entity/world statistics | Find dense entity hotspots |
@@ -68,6 +69,22 @@ python spark_toolkit.py tps https://spark.lucko.me/abc123
 python spark_toolkit.py hotspots https://spark.lucko.me/abc123 --exclude-sleep --thread server
 python spark_toolkit.py plugins https://spark.lucko.me/abc123
 python spark_toolkit.py report https://spark.lucko.me/abc123
+
+# Config review - analyze server configs from profile data (automatically parses server.properties, spigot.yml, bukkit.yml, paper-global.yml, paper-world.yml, canvas-server.json5, etc.)
+python spark_toolkit.py check-config https://spark.lucko.me/abc123 --gamemode smp
+
+# Config review - also provide local config files (supports .yml, .json, .json5, .properties, .toml)
+python spark_toolkit.py check-config https://spark.lucko.me/abc123 --gamemode skyblock --config-dir /path/to/server/
+
+# Config review - provide individual config files including Canvas, Velocity, Purpur, Pufferfish
+python spark_toolkit.py check-config https://spark.lucko.me/abc123 --gamemode bedwars \
+  --server-properties server.properties \
+  --spigot-yml spigot.yml \
+  --bukkit-yml bukkit.yml \
+  --canvas-config canvas-server.json5 \
+  --velocity-config velocity.toml \
+  --purpur-config purpur.yml \
+  --pufferfish-config pufferfish.yml
 ```
 
 ## Workflow Summary
@@ -80,6 +97,9 @@ python spark_toolkit.py report https://spark.lucko.me/abc123
 
 ### Heap/Memory Analysis
 1. `heap` -> `heap --plugin <name>` -> cross-ref with `gc` and `plugins` -> `entities` -> identify leaks/bloat
+
+### Server Config Review
+1. `info` -> identify platform, version, player count -> `check-config <source> --gamemode <type>` -> review findings with severity labels -> cross-reference with spark data (TPS, entity counts) -> present recommendations with risk labels WARN about bug-configs and dependency issues
 
 ### Server Config Review (Gamemode-Aware)
 1. `info` -> identify platform, version, plugins (gamemode type) -> ask user for config files or extract from analysis -> identify server type (SMP / Lobby / Bedwars / Skyblock / Factions / Creative / Modded) -> cross-reference spark findings with config -> generate gamemode-specific recommendations with safety checks -> WARN about bug-configs and dependency issues -> present with risk labels
@@ -365,6 +385,7 @@ See `references/server-config-review.md` for the complete gamemode-specific conf
 **What it is:** Complete JVM flag reference for Minecraft servers covering Aikar's G1GC flags, ZGC flags, common flags, memory sizing, bad flags to avoid, pause time targets, and JDK version recommendations.
 
 **Why use it:** When the diagnosis leads to "tune JVM/GC", this reference provides the exact flags and reasoning:
+
 - **Aikar's G1GC flags** -- complete flag set with detailed explanation of every flag's purpose and why the value was chosen
 - **ZGC flags** -- recommended set with ZGC-specific flags (SoftMaxHeapSize, ZAllocationSpikeTolerance, ZGenerational)
 - **ZGC cycles vs pauses distinction** -- critical for interpreting Spark data correctly
@@ -384,6 +405,31 @@ See `references/server-config-review.md` for the complete gamemode-specific conf
 - When you need to calculate appropriate heap size based on player count and server type
 - When recommending JDK version upgrades for better GC (especially JDK 21+ for generational ZGC)
 - When the user shares their startup script and you need to audit it
+
+---
+
+### `references/jvm-flags-advanced.md` -- Advanced JVM Flags Reference
+
+**What it is:** Comprehensive reference for ALL JVM flags used with Minecraft servers beyond GC tuning. Covers CPU flags, JIT compiler flags, memory management flags, system properties, Canvas/Folia-specific flags, and bad flags to avoid.
+
+**Why use it:** The `jvm-gc-tuning.md` reference covers GC flags, but Minecraft servers use many more JVM flags for optimization. This reference covers every flag you'll encounter in production startup scripts:
+
+- **GC Flags** -- G1GC, ZGC, and common GC tuning (see also: `jvm-gc-tuning.md`)
+- **Memory & Heap Flags** -- Xms/Xmx, AlwaysPreTouch, TransparentHugePages, CompactObjectHeaders, SoftRefLRUPolicyMSPerMB, AutoBoxCacheMax
+- **JIT Compiler Flags** -- CICompilerCount, MaxInlineLevel, MaxInlineSize, FreqInlineSize, InlineSmallCode, LoopUnrollLimit, UseSuperWord, UseVectorMacroLogic, SegmentedCodeCache, ReservedCodeCacheSize, NonProfiledCodeHeapSize, ProfiledCodeHeapSize, DontCompileHugeMethods, UseCriticalCompilerThreadPriority, UseCriticalJavaThreadPriority, UseFMA, UseCMoveUnconditionally, AlwaysActAsServerClassMachine
+- **CPU & Thread Flags** -- ActiveProcessorCount (MUST match actual cores), UseAVX (AVX=3 WARNING: requires AVX-512 CPU support)
+- **System Properties** -- log4j2.formatMsgNoLookups (Log4Shell mitigation), file.encoding, java.security.egd, user.timezone, net.kyori.ansi.colorLevel, terminal.jline, terminal.ansi, add-modules=jdk.incubator.vector (required for Canvas/Folia)
+- **Canvas/Folia-specific** -- required modules, recommended thread pools, region thread sizing
+- **Bad Flags to Avoid** -- ParallelGC, CMS, AggressiveOpts, mismatched Xms/Xmx, and more
+- **JVM Flag Assessment Template** -- ready-to-use checklist for auditing startup scripts
+
+**When to look at it:**
+- When `check-config` reports JVM flag findings and you need to understand what each flag does
+- When auditing a startup script for correctness and safety
+- When the user has unusual flags like `ActiveProcessorCount`, `UseAVX=3`, `MaxInlineLevel=20`, etc.
+- When you see Canvas/Folia startup scripts with `--add-modules=jdk.incubator.vector`
+- When evaluating whether a specific JVM flag is safe, recommended, or dangerous
+- When comparing the user's current flags against recommended values
 
 ---
 
