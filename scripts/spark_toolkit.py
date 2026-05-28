@@ -10,7 +10,7 @@ parsing by agents. Every command supports filtering to target specific
 threads, plugins, classes, methods, and time windows.
 
 Usage:
-    python spark_toolkit.py <command> [options]
+    python3 spark_toolkit.py <command> [options]
 
 Commands:
     fetch       Fetch profile data from spark.lucko.me URL
@@ -28,8 +28,20 @@ Commands:
     callpath    Trace call path to a specific method
     compare     Compare two time windows
     report      Generate full analysis report
+    analyze-gc  Deep GC analysis with ZGC/G1GC insights and tuning
+    analyze-tps TPS/MSPT analysis with lag spike detection
+    analyze-cpu CPU usage analysis with thread attribution
+    recommend   Comprehensive performance recommendations
+    check-config Analyze JVM flags and server config files
+    pipeline   Analyze netty pipeline handler chain
+    plugin-heap Heap usage attributed to a specific plugin
+    plugin-profile Complete plugin performance profile
 
-Run 'python spark_toolkit.py <command> --help' for command-specific options.
+Run 'python3 spark_toolkit.py <command> --help' for command-specific options.
+
+Dependencies:
+    protobuf    Required for parsing .sparkprofile binary files.
+                Install: pip install protobuf  (or pip3 install protobuf)
 """
 
 import argparse
@@ -490,6 +502,85 @@ def open_file(path):
     return open(path, "r", encoding="utf-8")
 
 
+def _is_likely_protobuf(file_path):
+    with open(file_path, "rb") as f:
+        header = f.read(8)
+    if len(header) < 2:
+        return False
+    first_byte = header[0]
+    json_starters = {0x7b, 0x5b, 0x22, 0x09, 0x0a, 0x0d, 0x20}
+    if first_byte in json_starters:
+        return False
+    if first_byte == 0x7d:
+        return False
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="strict") as f:
+            f.read(4096)
+        return False
+    except (UnicodeDecodeError, UnicodeError):
+        return True
+
+
+SLEEP_METHODS = {
+    "waitfornexttick", "thread.sleep", "locksupport.park", "object.wait",
+    "unsafe.park", "park", "parknanos", "parkuntil",
+}
+
+NATIVE_IDLE_METHODS = {
+    "pthread_cond_wait", "pthread_cond_timedwait", "pthread_cond_signal",
+    "pthread_mutex_lock", "pthread_mutex_unlock",
+    "epoll_wait", "epoll_pwait", "epoll_pwait2",
+    "waituntildeadline", "waitfortick",
+    "futex_wait", "futex_wake",
+    "__nanosleep", "__poll", "__select", "__accept",
+    "socketaccept",
+    "native_epoll_wait",
+}
+
+FOLIA_CANVAS_IDLE_PATTERNS = [
+    "affinityschedulerthreadpool$tickthreadrunner.waituntildeadline",
+    "affinityschedulerthreadpool$tickthreadrunner.waitfortick",
+    "tickregionScheduler$regionizedtaskqueue$regionqueue.scheduledinternal",
+    "regionizedtaskqueue",
+    "regionscheduler$regionschedulehandle",
+]
+
+
+def _is_idle_frame(class_name, method_name):
+    cn = (class_name or "").lower()
+    mn = (method_name or "").lower()
+    for s in SLEEP_METHODS:
+        if s in mn:
+            return True
+    for s in NATIVE_IDLE_METHODS:
+        if s in mn or s in cn:
+            return True
+    for pattern in FOLIA_CANVAS_IDLE_PATTERNS:
+        if pattern in cn or pattern in mn or pattern in (cn + "." + mn):
+            return True
+    return False
+
+
+def _is_folia_region_thread(thread_name):
+    n = thread_name.lower()
+    return "region" in n or "folia" in n or "canvas" in n or "tickthreadrunner" in n
+
+
+def _detect_jdk_version(sstats, meta):
+    java_info = sstats.get("java", {})
+    jvm_info = sstats.get("jvm", {})
+    jvm_version = java_info.get("version", jvm_info.get("version", ""))
+    flags_str = ""
+    configs = meta.get("serverConfigurations", meta.get("server_configurations", {}))
+    if configs:
+        flags_str = configs.get("jvm_args", configs.get("flags", ""))
+    if not flags_str:
+        flags_str = sstats.get("jvm_flags", "")
+    if not flags_str:
+        flags_str = java_info.get("flags", "")
+    return {"version": jvm_version, "flags": flags_str}
+
+
 def load_data(source):
     if source.startswith("http://") or source.startswith("https://"):
         pid = extract_id(source)
@@ -504,18 +595,16 @@ def load_data(source):
             return None, None
     if os.path.isfile(source):
         with open(source, "rb") as f:
-            header = f.read(4)
-        is_binary = False
-        try:
-            with open(source, "r", encoding="utf-8") as f:
-                f.read(1)
-        except (UnicodeDecodeError, UnicodeError):
-            is_binary = True
-        if is_binary or header[0] not in (0x7b, 0x5b, 0x7d, 0x22, 0x09, 0x0a, 0x0d, 0x20):
+            header = f.read(8)
+        is_protobuf = _is_likely_protobuf(source)
+        p = str(source).lower()
+        is_sparkprofile = p.endswith(".sparkprofile") or p.endswith(".sparkprofile.gz")
+        if is_protobuf or is_sparkprofile or header[0] not in (0x7b, 0x5b, 0x7d, 0x22, 0x09, 0x0a, 0x0d, 0x20):
             proto_result = parse_protobuf_file(source)
             if proto_result:
                 return proto_result, "file_protobuf"
-        p = str(source).lower()
+            if is_protobuf or is_sparkprofile:
+                return {"error": "Failed to parse protobuf file. Ensure 'protobuf' package is installed: pip install protobuf", "file": source}, "file_protobuf_error"
         if p.endswith(".gz"):
             with gzip.open(source, "rt", encoding="utf-8") as f:
                 content = f.read()
@@ -526,7 +615,10 @@ def load_data(source):
             data = json.loads(content)
             return data, "file_json"
         except json.JSONDecodeError:
-            return {"_raw_file": source, "_format": "protobuf_or_binary"}, "file_raw"
+            proto_result = parse_protobuf_file(source)
+            if proto_result:
+                return proto_result, "file_protobuf"
+            return {"_raw_file": source, "_format": "unparseable"}, "file_raw"
     try:
         return json.loads(source), "inline_json"
     except (json.JSONDecodeError, TypeError):
@@ -863,6 +955,33 @@ def cmd_info(args):
             if jvm.get("vendor"):
                 result["system"]["jvm_vendor"] = jvm["vendor"]
 
+        jdk_info = _detect_jdk_version(sstats, meta)
+        jdk_version = jdk_info.get("version", "")
+        jdk_major = 0
+        if jdk_version:
+            try:
+                parts = jdk_version.split(".")
+                if parts[0] == "1" and len(parts) > 1:
+                    jdk_major = int(parts[1])
+                else:
+                    jdk_major = int(parts[0])
+            except (ValueError, IndexError):
+                pass
+        jdk_notes = []
+        if jdk_major >= 25:
+            jdk_notes.append("JDK 25+: UseCompactObjectHeaders is available for reduced memory overhead")
+            jdk_notes.append("JDK 25+: ZGenerational (Generational ZGC) is production-ready and recommended over single-generation ZGC")
+            jdk_notes.append("JDK 25+: Compact Object Headers may cause issues with some native libraries - test thoroughly")
+        elif jdk_major >= 21:
+            jdk_notes.append("JDK 21+: ZGenerational (Generational ZGC) is available with -XX:+ZGenerational")
+            jdk_notes.append("JDK 21+: Virtual threads available but not recommended for Minecraft main tick loop")
+        elif jdk_major >= 17:
+            jdk_notes.append("JDK 17: Good baseline for Minecraft servers. Consider upgrading to JDK 21 for ZGenerational ZGC.")
+        elif jdk_major < 17 and jdk_major > 0:
+            jdk_notes.append(f"JDK {jdk_major}: Below JDK 17. Strongly recommend upgrading to JDK 21 for performance and security.")
+        if jdk_notes:
+            result["jdk_awareness"] = {"version": jdk_version, "major": jdk_major, "notes": jdk_notes}
+
     configs = meta.get("serverConfigurations", meta.get("server_configurations", {}))
     if configs:
         result["jvm_flags"] = configs.get("jvm_args", configs.get("flags", ""))
@@ -943,6 +1062,9 @@ def cmd_threads(args):
     result = {"total_threads": len(threads), "threads": []}
     thread_filters = args.thread if args.thread else None
 
+    meta = get_metadata(data)
+    sstats = get_system_stats(meta)
+
     for t in threads:
         name = t.get("name", "unknown")
         if not thread_matches(name, thread_filters):
@@ -954,37 +1076,63 @@ def cmd_threads(args):
 
         child_time = sum(sum(c.get("times", [])) for c in children if c.get("times"))
         sleep_time = 0
-        sleep_names = {"waitForNextTick", "Thread.sleep", "LockSupport.park", "Object.wait", "Unsafe.park", "park"}
+        native_idle_time = 0
         tick_time = 0
         tick_names = {"tick", "doTick", "runTick"}
+        is_folia_thread = _is_folia_region_thread(name)
+
+        def _walk_frames(node, depth=0):
+            nonlocal sleep_time, native_idle_time, tick_time
+            cn = node.get("className", node.get("class_name", ""))
+            mn = node.get("methodName", node.get("method_name", ""))
+            ct = sum(node.get("times", [])) if node.get("times") else 0
+            if any(tk in mn for tk in tick_names):
+                tick_time += ct
+            mn_lower = mn.lower()
+            cn_lower = cn.lower()
+            is_sleep = any(s in mn_lower for s in SLEEP_METHODS)
+            is_native_idle = any(s in mn_lower or s in cn_lower for s in NATIVE_IDLE_METHODS)
+            is_folia_idle = any(p in (cn_lower + "." + mn_lower) for p in FOLIA_CANVAS_IDLE_PATTERNS)
+            if is_sleep:
+                sleep_time += ct
+            if is_native_idle or (is_folia_idle and is_folia_thread):
+                native_idle_time += ct
+            for child in node.get("children", []):
+                _walk_frames(child, depth + 1)
 
         for c in children:
-            mn = c.get("methodName", c.get("method_name", ""))
-            ct_list = c.get("times", [])
-            ct_sum = sum(ct_list) if ct_list else 0
-            if any(s in mn for s in sleep_names):
-                sleep_time += ct_sum
-            if any(tk in mn for tk in tick_names):
-                tick_time += ct_sum
+            _walk_frames(c)
+
+        effective_idle = sleep_time + native_idle_time
+        effective_idle_pct = pct(effective_idle, total_time)
+        active_time = total_time - effective_idle
+        active_pct = pct(active_time, total_time)
 
         entry = {
             "name": name,
             "total_time": total_time,
             "sleep_time": sleep_time,
-            "sleep_pct": pct(sleep_time, total_time),
+            "native_idle_time": native_idle_time,
+            "effective_idle_time": effective_idle,
+            "effective_idle_pct": effective_idle_pct,
+            "active_time": active_time,
+            "active_pct": active_pct,
             "tick_time": tick_time,
             "tick_pct": pct(tick_time, total_time),
-            "other_time": total_time - sleep_time - tick_time,
+            "other_time": total_time - effective_idle - tick_time,
             "child_count": len(children),
+            "is_folia_region_thread": is_folia_thread,
         }
 
-        sleep_pct_val = pct(sleep_time, total_time)
-        if sleep_pct_val >= 50:
+        if effective_idle_pct >= 50:
             entry["health"] = "HEALTHY"
-        elif sleep_pct_val >= 20:
+        elif effective_idle_pct >= 20:
             entry["health"] = "MODERATE"
         else:
             entry["health"] = "OVERLOADED"
+
+        sleep_pct_val = pct(sleep_time, total_time)
+        entry["sleep_pct"] = sleep_pct_val
 
         if args.top is not None and args.top > 0:
             entry["top_children"] = []
@@ -1088,8 +1236,7 @@ def cmd_hotspots(args):
                     if args.class_filter.lower() not in sig:
                         continue
                 if args.exclude_sleep:
-                    sleep_names = {"waitfornexttick", "thread.sleep", "locksupport.park", "object.wait", "unsafe.park"}
-                    if any(s in h["method"].lower() for s in sleep_names):
+                    if _is_idle_frame(h["class"], h["method"]):
                         continue
                 all_hotspots.append(h)
 
@@ -1620,10 +1767,10 @@ def cmd_report(args):
             total_time = sum(times) if times else 0
             children = t.get("children", [])
             sleep_time = 0
-            sleep_names = {"waitForNextTick", "Thread.sleep", "LockSupport.park", "Object.wait", "Unsafe.park", "park"}
             for c in children:
+                cn = c.get("className", c.get("class_name", ""))
                 mn = c.get("methodName", c.get("method_name", ""))
-                if any(s in mn for s in sleep_names):
+                if _is_idle_frame(cn, mn):
                     sleep_time += sum(c.get("times", []))
             sleep_pct = pct(sleep_time, total_time)
             if sleep_pct < 5:
@@ -2016,6 +2163,248 @@ def cmd_analyze_cpu(args):
     return result
 
 
+def cmd_pipeline(args):
+    data, src = load_data(args.source)
+    if not data:
+        return {"error": "Could not load data from source"}
+
+    threads = get_threads(data)
+    if not threads:
+        return {"error": "No thread data found."}
+
+    thread_filters = args.thread if args.thread else ["netty"]
+    netty_threads = [t for t in threads if thread_matches(t.get("name", ""), thread_filters)]
+
+    if not netty_threads:
+        return {"error": "No netty threads found. Use --thread to specify thread name containing 'netty'."}
+
+    result = {"handlers": [], "duplicate_warnings": []}
+    handler_set = {}
+
+    for t in netty_threads:
+        name = t.get("name", "unknown")
+        times = t.get("times", [])
+        total_time = sum(times) if times else 0
+
+        def find_pipeline_handlers(node, depth=0, pipeline_path=None):
+            if pipeline_path is None:
+                pipeline_path = []
+            cn = node.get("className", node.get("class_name", ""))
+            mn = node.get("methodName", node.get("method_name", ""))
+            ct = sum(node.get("times", [])) if node.get("times") else 0
+            sig = f"{cn}.{mn}"
+            current_path = pipeline_path + [sig]
+
+            is_handler = False
+            cn_lower = cn.lower()
+            handler_keywords = ["handler", "channel", "pipeline", "encoder", "decoder", "packet", "connection", "protocol"]
+            if any(kw in cn_lower for kw in handler_keywords):
+                is_handler = True
+            if "netty" in cn_lower:
+                is_handler = True
+
+            if is_handler and depth > 0:
+                handler_entry = {
+                    "class": cn,
+                    "method": mn,
+                    "time": ct,
+                    "pct": pct(ct, total_time),
+                    "thread": name,
+                    "depth": depth,
+                    "path": " -> ".join(current_path),
+                }
+                result["handlers"].append(handler_entry)
+                short_name = cn.split(".")[-1]
+                if short_name in handler_set:
+                    handler_set[short_name].append(cn)
+                else:
+                    handler_set[short_name] = [cn]
+
+            for child in node.get("children", []):
+                find_pipeline_handlers(child, depth + 1, current_path)
+
+        for child in t.get("children", []):
+            find_pipeline_handlers(child)
+
+    if args.detect_duplicates:
+        for hname, classes in handler_set.items():
+            unique_classes = list(set(classes))
+            if len(unique_classes) > 1:
+                result["duplicate_warnings"].append({
+                    "handler_short_name": hname,
+                    "classes": unique_classes,
+                    "count": len(unique_classes),
+                    "detail": f"{hname} has {len(unique_classes)} different implementations in the pipeline - possible shaded duplicate",
+                })
+
+    result["total_handlers"] = len(result["handlers"])
+    result["unique_handler_names"] = len(handler_set)
+    result["threads_analyzed"] = [t.get("name", "unknown") for t in netty_threads]
+
+    return result
+
+
+def cmd_plugin_heap(args):
+    data, src = load_data(args.source)
+    if not data:
+        return {"error": "Could not load data from source"}
+
+    entries = data.get("entries", [])
+    if not entries:
+        return {"info": "No heap entries found in data"}
+
+    plugin_name = args.plugin
+    if not plugin_name:
+        return {"error": "Plugin name required. Use --plugin <name>"}
+
+    class_sources = get_class_sources(data)
+    meta = get_metadata(data)
+    sources_meta = get_sources(meta)
+
+    plugin_classes = set()
+    for cls, src_name in class_sources.items():
+        src_info = sources_meta.get(src_name, {})
+        src_label = src_info.get("name", src_name)
+        if plugin_name.lower() in src_label.lower() or plugin_name.lower() in cls.lower():
+            plugin_classes.add(cls)
+
+    total_size = sum(e.get("size", 0) for e in entries)
+    total_instances = sum(e.get("instances", 0) for e in entries)
+
+    plugin_entries = []
+    plugin_size = 0
+    plugin_instances = 0
+    for e in entries:
+        type_name = e.get("type", "")
+        matched = False
+        for cls in plugin_classes:
+            if cls.lower() in type_name.lower():
+                matched = True
+                break
+        if not matched and plugin_name.lower() in type_name.lower():
+            matched = True
+        if matched:
+            plugin_size += e.get("size", 0)
+            plugin_instances += e.get("instances", 0)
+            plugin_entries.append({
+                "type": type_name,
+                "instances": e.get("instances", 0),
+                "size_bytes": e.get("size", 0),
+                "size_human": format_bytes(e.get("size", 0)),
+                "pct_of_total": pct(e.get("size", 0), total_size),
+            })
+
+    plugin_entries.sort(key=lambda e: -e["size_bytes"])
+
+    pct_of_heap = pct(plugin_size, total_size)
+    assessment = "GOOD"
+    if pct_of_heap > 10:
+        assessment = "CRITICAL"
+    elif pct_of_heap > 5:
+        assessment = "WARNING"
+
+    return {
+        "plugin": plugin_name,
+        "plugin_heap_bytes": plugin_size,
+        "plugin_heap_human": format_bytes(plugin_size),
+        "pct_of_total_heap": pct_of_heap,
+        "assessment": assessment,
+        "plugin_instances": plugin_instances,
+        "matched_classes": len(plugin_classes),
+        "top_entries": plugin_entries[:args.limit],
+    }
+
+
+def cmd_plugin_profile(args):
+    data, src = load_data(args.source)
+    if not data:
+        return {"error": "Could not load data from source"}
+
+    plugin_name = args.plugin
+    if not plugin_name:
+        return {"error": "Plugin name required. Use --plugin <name>"}
+
+    meta = get_metadata(data)
+    pstats = get_platform_stats(meta)
+    threads = get_threads(data)
+    class_sources = get_class_sources(data)
+    method_sources = get_method_sources(data)
+    sources_meta = get_sources(meta)
+
+    result = {"plugin": plugin_name}
+
+    source_totals = defaultdict(float)
+    for t in threads:
+        times = t.get("times", [])
+        total_time = sum(times) if times else 0
+        for child in t.get("children", []):
+            attrs = attribute_to_source(child, class_sources, method_sources, sources_meta)
+            for d in attrs:
+                for k, v in d.items():
+                    if plugin_name.lower() in k.lower():
+                        source_totals[k] += v
+
+    grand_total = sum(sum(t.get("times", [])) for t in threads) or 1
+    plugin_time = sum(source_totals.values())
+    result["cpu"] = {
+        "total_time": plugin_time,
+        "pct_of_total": pct(plugin_time, grand_total),
+        "sources": {k: pct(v, grand_total) for k, v in source_totals.items()},
+    }
+
+    cpu_pct = pct(plugin_time, grand_total)
+    if cpu_pct > 20:
+        result["cpu"]["assessment"] = "CRITICAL"
+    elif cpu_pct > 5:
+        result["cpu"]["assessment"] = "WARNING"
+    else:
+        result["cpu"]["assessment"] = "LOW"
+
+    entries = data.get("entries", [])
+    if entries:
+        total_size = sum(e.get("size", 0) for e in entries)
+        plugin_size = 0
+        plugin_entries = []
+        for e in entries:
+            type_name = e.get("type", "")
+            if plugin_name.lower() in type_name.lower():
+                plugin_size += e.get("size", 0)
+                plugin_entries.append({"type": type_name, "size_bytes": e.get("size", 0), "instances": e.get("instances", 0)})
+        plugin_entries.sort(key=lambda e: -e["size_bytes"])
+        heap_pct = pct(plugin_size, total_size)
+        result["heap"] = {
+            "plugin_heap_bytes": plugin_size,
+            "plugin_heap_human": format_bytes(plugin_size),
+            "pct_of_total_heap": heap_pct,
+            "assessment": "CRITICAL" if heap_pct > 10 else "WARNING" if heap_pct > 5 else "LOW",
+            "top_entries": plugin_entries[:10],
+        }
+
+    hotspots_list = []
+    for t in threads:
+        times = t.get("times", [])
+        total_time = sum(times) if times else 0
+        for child in t.get("children", []):
+            for h in find_hotspots(child, total_time, min_pct=0.5):
+                cn = h.get("class", "")
+                if plugin_name.lower() in cn.lower():
+                    h["thread"] = t.get("name", "unknown")
+                    hotspots_list.append(h)
+    hotspots_list.sort(key=lambda h: -h.get("self_pct", 0))
+    result["hotspots"] = hotspots_list[:20]
+
+    findings = []
+    if result["cpu"]["pct_of_total"] > 20:
+        findings.append({"severity": "CRITICAL", "detail": f"{plugin_name} uses {result['cpu']['pct_of_total']}% of CPU time. This is very high and likely causing TPS issues."})
+    elif result["cpu"]["pct_of_total"] > 5:
+        findings.append({"severity": "WARNING", "detail": f"{plugin_name} uses {result['cpu']['pct_of_total']}% of CPU time. Monitor for performance impact."})
+    if entries and result.get("heap", {}).get("pct_of_total_heap", 0) > 10:
+        findings.append({"severity": "CRITICAL", "detail": f"{plugin_name} uses {result['heap']['pct_of_total_heap']}% of heap. Potential memory leak or bloat."})
+    result["findings"] = findings
+
+    return result
+
+
 def cmd_recommend(args):
     data, src = load_data(args.source)
     if not data:
@@ -2073,9 +2462,10 @@ def cmd_recommend(args):
                 continue
             children = t.get("children", [])
             sleep_time = 0
-            sleep_names = {"waitForNextTick", "Thread.sleep", "LockSupport.park", "Object.wait", "Unsafe.park"}
-            for c in children:
-                if any(s in c.get("methodName", c.get("method_name", "")) for s in sleep_names):
+            for c in t.get("children", []):
+                cn = c.get("className", c.get("class_name", ""))
+                mn = c.get("methodName", c.get("method_name", ""))
+                if _is_idle_frame(cn, mn):
                     sleep_time += sum(c.get("times", []))
             sleep_pct = pct(sleep_time, total)
             if sleep_pct < 5:
@@ -3147,6 +3537,20 @@ def build_parser():
     p_check.add_argument("--pufferfish-config", help="Path to pufferfish.yml file")
     p_check.add_argument("--purpur-config", help="Path to purpur.yml file")
 
+    # pipeline
+    p_pipeline = sub.add_parser("pipeline", parents=[common], help="Analyze netty pipeline handler chain and detect duplicate shaded handlers")
+    p_pipeline.add_argument("--thread", "-t", nargs="+", default=["netty"], help="Netty thread name filter (default: netty)")
+    p_pipeline.add_argument("--detect-duplicates", action="store_true", help="Detect and warn about duplicate shaded handlers in the pipeline")
+
+    # plugin-heap
+    p_pluginheap = sub.add_parser("plugin-heap", parents=[common], help="Heap usage attributed to a specific plugin")
+    p_pluginheap.add_argument("--plugin", "-p", required=True, help="Plugin name or package to attribute heap to")
+    p_pluginheap.add_argument("--limit", type=int, default=30, help="Max entries to return (default: 30)")
+
+    # plugin-profile
+    p_pluginprofile = sub.add_parser("plugin-profile", parents=[common], help="Complete plugin performance profile (CPU + heap + findings)")
+    p_pluginprofile.add_argument("--plugin", "-p", required=True, help="Plugin name or package to profile")
+
     return parser
 
 
@@ -3179,6 +3583,9 @@ def main():
         "analyze-cpu": cmd_analyze_cpu,
         "recommend": cmd_recommend,
         "check-config": cmd_check_config,
+        "pipeline": cmd_pipeline,
+        "plugin-heap": cmd_plugin_heap,
+        "plugin-profile": cmd_plugin_profile,
     }
 
     handler = commands.get(args.command)

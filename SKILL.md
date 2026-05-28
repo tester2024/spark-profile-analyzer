@@ -36,6 +36,23 @@ Analyze Lucko Spark profiler data for Minecraft servers using `scripts/spark_too
 | Local JSON file | Any previously saved spark profile JSON |
 | Inline JSON | Pasted JSON data |
 
+## Prerequisites
+
+The toolkit requires `protobuf` for parsing `.sparkprofile` binary files. Install before use:
+
+```bash
+# Linux/macOS
+pip3 install protobuf
+
+# Windows
+pip install protobuf
+
+# Or using requirements.txt
+pip install -r scripts/requirements.txt
+```
+
+If protobuf is not installed, the toolkit will still work with JSON data and spark URLs, but will fail on binary `.sparkprofile` files with a clear error message. Use `python3` on Linux/macOS and `python` on Windows.
+
 ## Commands Overview
 
 All analysis goes through `scripts/spark_toolkit.py`. Every command outputs structured JSON.
@@ -55,6 +72,7 @@ All analysis goes through `scripts/spark_toolkit.py`. Every command outputs stru
 | `check-config` | Analyze JVM flags + server config files with gamemode-aware safety checks | **Config review**; finds bug-configs, dependency issues, and gameplay-breaking settings |
 | `plugin-heap` | Heap attributed to one plugin | Check a specific plugin's memory usage |
 | `plugin-profile` | Complete plugin perf profile (CPU+heap+findings) | Deep-dive on one plugin |
+| `pipeline` | Analyze netty pipeline handler chain and detect duplicate shaded handlers | Find netty pipeline issues and shaded library conflicts |
 | `entities` | Entity/world statistics | Find dense entity hotspots |
 | `compare` | Compare two time windows | See performance changes over time |
 | `report` | Full analysis with findings | Generate complete report with auto-findings |
@@ -64,11 +82,23 @@ All analysis goes through `scripts/spark_toolkit.py`. Every command outputs stru
 ### Quick Start
 
 ```bash
-python spark_toolkit.py info https://spark.lucko.me/abc123
-python spark_toolkit.py tps https://spark.lucko.me/abc123
-python spark_toolkit.py hotspots https://spark.lucko.me/abc123 --exclude-sleep --thread server
-python spark_toolkit.py plugins https://spark.lucko.me/abc123
-python spark_toolkit.py report https://spark.lucko.me/abc123
+python3 spark_toolkit.py info https://spark.lucko.me/abc123
+python3 spark_toolkit.py tps https://spark.lucko.me/abc123
+python3 spark_toolkit.py hotspots https://spark.lucko.me/abc123 --exclude-sleep --thread server
+python3 spark_toolkit.py plugins https://spark.lucko.me/abc123
+python3 spark_toolkit.py report https://spark.lucko.me/abc123
+
+# Heap/memory analysis
+python3 spark_toolkit.py heap https://spark.lucko.me/abc123
+python3 spark_toolkit.py plugin-heap https://spark.lucko.me/abc123 --plugin MyPlugin
+python3 spark_toolkit.py gc https://spark.lucko.me/abc123
+
+# Netty pipeline analysis (detect duplicate shaded handlers)
+python3 spark_toolkit.py pipeline https://spark.lucko.me/abc123 --detect-duplicates
+
+# Folia/Canvas analysis (native idle detection works correctly)
+python3 spark_toolkit.py threads https://spark.lucko.me/abc123 --thread Region
+python3 spark_toolkit.py hotspots https://spark.lucko.me/abc123 --thread Region --exclude-sleep
 
 # Config review - analyze server configs from profile data (automatically parses server.properties, spigot.yml, bukkit.yml, paper-global.yml, paper-world.yml, canvas-server.json5, etc.)
 python spark_toolkit.py check-config https://spark.lucko.me/abc123 --gamemode smp
@@ -96,7 +126,18 @@ python spark_toolkit.py check-config https://spark.lucko.me/abc123 --gamemode be
 1. `info` -> `plugins` -> `tree --plugin <name>` -> `hotspots --class-filter <name>` -> `callpath <method>` -> `gc` -> `heap --plugin <name>` -> summarize findings
 
 ### Heap/Memory Analysis
-1. `heap` -> `heap --plugin <name>` -> cross-ref with `gc` and `plugins` -> `entities` -> identify leaks/bloat
+1. `heap` -> `plugin-heap --plugin <name>` -> cross-ref with `gc` and `plugins` -> `entities` -> identify leaks/bloat
+
+### Heap Dump Analysis (External)
+1. Collect heap dump: `jmap -dump:format=b,file=heap.hprof <pid>` or `/spark heapsummary`
+2. Analyze with `scripts/heapdump_analyzer.py analyze --jmap-histogram histogram.txt`
+3. Or connect to running server: `scripts/heapdump_analyzer.py analyze --pid <pid>`
+4. Check leak patterns: `scripts/heapdump_analyzer.py leak-check --jmap-histogram histogram.txt`
+5. Cross-reference with spark data: `heap` -> `plugin-heap` -> `gc` -> correlate findings
+
+### Netty Pipeline Analysis
+1. `pipeline --thread netty --detect-duplicates` -> identify handler chain and shaded duplicates
+2. Cross-reference with `hotspots --thread netty` -> see which handlers consume the most time
 
 ### Server Config Review
 1. `info` -> identify platform, version, player count -> `check-config <source> --gamemode <type>` -> review findings with severity labels -> cross-reference with spark data (TPS, entity counts) -> present recommendations with risk labels WARN about bug-configs and dependency issues
@@ -541,6 +582,89 @@ See detailed entry above. (Duplicate reference path -- content is identical.)
 
 ---
 
+### `references/folia-canvas-analysis.md` -- Folia/Canvas Thread Analysis
+
+**What it is:** Deep guide for analyzing Folia and Canvas Minecraft server profiler data, addressing the fact that standard thread health assessment (based on sleep_pct) is broken for region-threaded servers because native parking frames (pthread_cond_wait, parkNanos) are not counted as idle.
+
+**Why use it:** Folia and Canvas servers use region-based parallel ticking. Standard Spark analysis shows all region threads as OVERLOADED with 0% sleep because `LockSupport.parkNanos` and `pthread_cond_timedwait` are not recognized as idle. This reference covers the fix and how to properly analyze Folia/Canvas:
+
+- **Threading model overview** -- Folia (Paper fork with region threading) vs Canvas (Folia fork with AffinitySchedulerThreadPool), how region threads work, why standard thread health fails
+- **Thread type table** -- all thread types on Folia/Canvas with name patterns, idle methods, and purposes
+- **Idle vs active recognition** -- complete table of idle frame signatures (waitUntilDeadline, parkNanos, pthread_cond_wait, epoll_pwait2) and active frame signatures (tickRegion, forEachTickingEntity, tickBlockEntities)
+- **effective_idle_pct** -- the new metric that combines Java sleep and native idle time for accurate Folia/Canvas thread health assessment
+- **New health thresholds** -- HEALTHY >= 50%, MODERATE 20-50%, OVERLOADED < 20% (based on effective_idle_pct, not sleep_pct)
+- **spark_toolkit.py commands for Folia** -- specific command examples with `--thread Region`, `--exclude-sleep`, `effective_idle_pct` interpretation
+- **Region thread performance analysis** -- how to find entity tick dominance, region imbalance, cross-region synchronization
+- **Canvas-specific config** -- `canvas-server.json5` options, `--add-modules=jdk.incubator.vector` requirement, thread count recommendations
+- **Folia/Canvas config recommendations** -- region-thread-count formula, view-distance vs simulation-distance on Folia, entity activation ranges, parallel scheduling
+- **Common Folia/Canvas issues table** -- 10 issues with detection commands, root causes, and fixes
+- **Complete command reference** -- 14 commands specifically for Folia/Canvas analysis with interpretation patterns
+
+**When to look at it:**
+- When `threads` shows all region threads as OVERLOADED with 0% sleep -- this is the Folia/Canvas idle detection issue
+- When analyzing a Folia or Canvas server and needing region-specific analysis commands
+- When needing to interpret `effective_idle_pct` vs `sleep_pct` for thread health
+- When recommending region-thread-count or other Folia/Canvas-specific configuration
+- When diagnosing region imbalance (some regions overloaded, others idle)
+- When checking for Canvas-specific requirements (jdk.incubator.vector, async chunks)
+
+---
+
+### `references/heapdump-analysis-guide.md` -- Heap Dump Analysis Guide
+
+**What it is:** Comprehensive guide for analyzing Java heap dumps (.hprof files) for Minecraft servers. Covers collecting heap dumps, using `heapdump_analyzer.py`, interpreting jmap output, identifying memory leaks, and correlating with Spark data. Supports both Windows and Linux.
+
+**Why use it:** When spark `heap` or `gc` data indicates memory pressure, you need deeper analysis. Heap dumps provide the detailed object-level breakdown that spark can't:
+
+- **Collecting heap dumps** -- 9 methods with platform-specific commands: `/spark heapsummary`, `jmap -dump`, `jcmd GC.heap_dump`, Eclipse MAT, VisualVM, and OOM auto-dump
+- **Using heapdump_analyzer.py** -- `analyze` (connect to running server or parse jmap output), `commands` (show platform-specific diagnostic commands), `leak-check` (check against known Minecraft leak patterns)
+- **Heap histogram analysis** -- jmap -histo:live output interpretation, normal vs abnormal thresholds for every type (entities, chunks, strings, byte[], collections, netty)
+- **Minecraft-specific memory patterns** -- what normal heap composition looks like at different scales, when each type becomes a problem
+- **Memory leak vs bloat decision tree** -- 4-outcome test (leak vs bloat, old gen growth, full GC effectiveness)
+- **8 common leak patterns** -- static collection leak, thread-local leak, listener leak, cache without eviction, reference queue leak, classloader leak, direct buffer leak, region file cache leak
+- **GC log indicators** -- old gen monotonic growth, full GC frees little, metaspace growth, allocation rate increase with jstat/jcmd commands
+- **Diagnostic commands reference** -- complete tables for both Linux and Windows
+- **Correlating with Spark** -- how to cross-reference `spark_toolkit.py heap`, `plugin-heap`, `gc` with heapdump data
+- **Eclipse MAT quick reference** -- OQL queries for Minecraft-specific objects, key reports
+- **Fixing common memory issues** -- entity reduction, chunk tuning, string deduplication, buffer management, cache sizing, ThreadLocal cleanup
+
+**When to look at it:**
+- When spark shows heap usage >70% or GC WARNING/CRITICAL
+- When `plugin-heap` shows a plugin using >5% of heap
+- When you suspect a memory leak (growing old gen, OOM errors, increasing GC frequency)
+- When a user mentions "out of memory", "server crashes", "increasing RAM usage"
+- When you need jstat/jmap/jcmd commands for a running server (Windows or Linux)
+- When heap dump data is available and you need to identify the root cause of memory pressure
+
+---
+
+### `references/memory-leak-detection.md` -- Memory Leak Detection Reference
+
+**What it is:** Step-by-step guide for detecting, diagnosing, and fixing memory leaks in Minecraft servers using both Spark profiler data and heap dumps. Covers leak indicators visible in spark data, heap dump analysis patterns, and complete diagnostic workflows.
+
+**Why use it:** Memory leaks are one of the hardest issues to diagnose. This reference bridges the gap between spark's runtime data and heap dump analysis:
+
+- **Leak vs bloat definition** -- clear distinction with diagnostic decision tree
+- **Detecting leaks from Spark data** -- using `heap`, `plugin-heap`, `gc`, and `plugin-profile` to identify leak patterns
+- **Spark GC indicators of leaks** -- 4 key indicators with thresholds: old gen growth, full GC ineffectiveness, allocation rate increase, metaspace growth
+- **Detecting leaks from heap dumps** -- `heapdump_analyzer.py analyze` and `leak-check` commands with examples
+- **10 Minecraft-specific memory leak patterns** -- entity accumulation, chunk loading leak, connection leak, NBT bloat, plugin cache leak, ThreadLocal leak, listener leak, direct buffer leak, classloader leak, RegionFile cache growth
+- **Each pattern includes** -- heap signature, detection command, root cause, severity, and specific fix
+- **Complete leak detection workflow** -- step-by-step: spark heap → spark gc → spark plugin-heap → heapdump_analyzer → Eclipse MAT → identify root cause
+- **jstat and jcmd reference** -- complete table of useful commands for leak detection
+
+**When to look at it:**
+- When spark shows continuously growing heap usage
+- When `gc` shows WARNING/CRITICAL with increasing old gen
+- When `plugin-heap` shows a plugin whose memory share is growing
+- When a user reports "server gets slower over time" or "I have to restart daily"
+- When OOM errors appear in server logs
+- When `heapdump_analyzer.py leak-check` findings need interpretation
+
+---
+
 ## Scripts
 
-- `scripts/spark_toolkit.py` -- Main analysis CLI. All commands and reference docs above describe this script.
+- `scripts/spark_toolkit.py` -- Main analysis CLI. All commands and reference docs above describe this script. **Requirements:** `protobuf>=4.21.0` for binary `.sparkprofile` parsing (see `scripts/requirements.txt`). Use `python3` on Linux/macOS, `python` on Windows.
+- `scripts/heapdump_analyzer.py` -- Heap dump analyzer for Minecraft servers. Detects memory leaks, bloat, and usage patterns from jmap histograms and running Java processes. Supports both Windows and Linux. No external dependencies (uses jmap/jstat/jcmd which come with JDK). Runs independently from spark_toolkit.py.
+- `scripts/requirements.txt` -- Python dependencies: `protobuf>=4.21.0` (required for parsing binary .sparkprofile files)
