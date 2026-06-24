@@ -19,10 +19,11 @@ Process CPU% can exceed 100% on multi-core systems:
 
 | Process CPU% | On 4-core system | On 8-core system |
 |-------------|-----------------|-----------------|
-| 25% | 1 core fully used | 2 cores at 50% or 1 at 25% |
-| 100% | All 4 cores fully used | 4 cores fully used |
-| 200% | Not possible (4 cores) | 4 cores fully used |
-| 400% | Not possible (4 cores) | All 8 cores fully used |
+| 25% | 1 core at 25% (or 1 thread ≈ ¼ core) | 1 core at 25% |
+| 100% | 1 core fully used | 1 core fully used |
+| 200% | 2 cores fully used | 2 cores fully used |
+| 400% | All 4 cores fully used | 4 cores fully used |
+| 800% | Not possible (max = 400%) | All 8 cores fully used |
 
 **Formula**: Max process CPU = cores × 100%
 

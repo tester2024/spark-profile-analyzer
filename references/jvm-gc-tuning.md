@@ -22,14 +22,12 @@ The standard Aikar's flags are the most widely recommended JVM settings for Mine
 -XX:G1MixedGCCountTarget=4
 -XX:InitiatingHeapOccupancyPercent=15
 -XX:G1MixedGCLiveThresholdPercent=90
--XX:G1OldCSetSetThresholdThreshold=JDK8:80,JDK11+:10
--XX:SurvivorRatio=32
--XX:PerTenureThreshold=1
--XX:G1OldCSetSetThresholdThreshold=10 (JDK 17+)
+-XX:G1OldCSetRegionThresholdPercent=JDK8:80,JDK11+:10
 -XX:+AlwaysPreTouch
 -XX:+UseLargePagesInMetaspace
--javaagent:spark.jar
 ```
+
+> **Note:** The canonical Aikar's flag set ends at `-XX:+UseLargePagesInMetaspace`. Lines sometimes seen appended to this block (`-javaagent:spark.jar`, etc.) are *deployment* artifacts (attaching the spark profiler agent), not GC tuning flags -- keep them separate from the canonical set. The deprecated `G1OldCSetSetThresholdThreshold`/`PerTenureThreshold` flag names sometimes copied from stale guides are not real JVM options; the correct name is `G1OldCSetRegionThresholdPercent` (and `MaxTenuringThreshold=1` already covers tenuring). Source: https://docs.papermc.io/paper/aikars-flags
 
 ### Flag Explanations
 
@@ -104,7 +102,7 @@ ZGC is a concurrent garbage collector designed for sub-millisecond pauses. Avail
 
 | Factor | G1GC Preferred | ZGC Preferred |
 |--------|----------------|---------------|
-| Heap size | 4-16GB | 16GB+ |
+| Heap size | 4-24GB | 24GB+ (consider at 16GB+, mandatory at 32GB+) |
 | JDK version | Any (8+) | 17+ (21+ for generational) |
 | Player count | < 100 | 100+ |
 | Server type | Survival, small community | Large network, modded |
@@ -185,7 +183,7 @@ Total RAM = (Base overhead ~2-3GB) + (Players × per-player RAM) + (Worlds × 50
 | `-XX:+UseConcMarkSweepGC` | Removed in JDK 14+ | Use G1GC or ZGC |
 | `-XX:+UseSerialGC` | Single-threaded, terrible for MC | Use G1GC |
 | `-XX:+AggressiveOpts` | Unstable optimizations, may crash | Remove it |
-| `-XX:+UseLargePages` | Requires OS config, crashes if misconfigured | Use LargePagesInMetaspace |
+| `-XX:+UseLargePages` (without OS reservation) | JVM falls back to small pages or aborts with "Large pages failed" if no huge pages are reserved | Reserve huge pages at the OS, then enable -- see the Large Pages section in `jvm-flags-advanced.md`. (Note: `UseLargePagesInMetaspace` is a *companion* flag for metaspace, not a replacement.) |
 | `-Xmn` / `-XX:NewSize` | Overrides G1 adaptive sizing | Use G1NewSizePercent |
 | `-XX:SurvivorRatio=8` | Default too small for MC | Use 32 (Aikar's) |
 | `-XX:MaxTenuringThreshold=15` | Default too high for MC | Use 1 (Aikar's) |

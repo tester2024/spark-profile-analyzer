@@ -147,7 +147,7 @@ Timeline:
 [Normal] Old gen slowly growing → 60% → 70% → 80%
 [Warning] G1 mixed collections increasing → 85% → 90%
 [Critical] Full GC triggered → pause 1-10 seconds → frees some space
-[Terminanl] Full GC cannot free enough → OOM
+[Terminal] Full GC cannot free enough → OOM
 ```
 
 **Diagnosis**: Objects that should be short-lived are being promoted to old gen. Either the young gen is too small, or there's a genuine memory leak.
@@ -292,8 +292,9 @@ Is GC causing lag? (STW pauses > 50ms or > 5% of time)
 
 ```
 Should I switch from G1GC to ZGC?
-├── Heap > 16GB → Consider ZGC
-├── Heap > 32GB → Switch to ZGC (mandatory for good performance)
+├── Heap > 16GB → Consider ZGC (valid alternative, weigh CPU cost)
+├── Heap > 24GB → Recommend ZGC (G1GC region management gets harder)
+├── Heap > 32GB → Switch to ZGC (mandatory; G1GC struggles above 32GB)
 ├── JDK < 17 → Stay on G1GC (ZGC not production-ready)
 ├── JDK 17-20 → ZGC viable but no generational mode
 ├── JDK 21+ → ZGC with generational mode is excellent

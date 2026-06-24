@@ -18,7 +18,7 @@ Full reference for every `spark_toolkit.py` command, its flags, and targeting/fi
 | `heap` | Heap summary with plugin attribution | `--type-filter`, `--plugin`, `--limit` |
 | `entities` | Entity/world statistics | `--entity-type`, `--min-entities` |
 | `plugin-heap` | Heap usage attributed to a specific plugin | `--plugin` (required), `--limit` |
-| `plugin-profile` | Complete plugin performance profile (CPU + heap + findings) | `--plugin` (required), `--thread` |
+| `plugin-profile` | Complete plugin performance profile (CPU + heap + findings) | `--plugin` (required) |
 | `search` | Search stack traces by pattern | `pattern`, `--regex`, `--thread`, `--limit` |
 | `callpath` | Trace call path to a method | `method`, `--regex`, `--thread`, `--limit` |
 | `compare` | Compare two time windows | `--window-a`, `--window-b` |
@@ -27,7 +27,8 @@ Full reference for every `spark_toolkit.py` command, its flags, and targeting/fi
 | `analyze-tps` | TPS/MSPT analysis with lag spike detection | - |
 | `analyze-cpu` | CPU usage analysis with process/system breakdown | - |
 | `recommend` | Performance recommendations with priority actions | - |
-| `check-config` | JVM flags + server config analysis with gamemode-aware safety checks | `--platform`, `--gamemode`, `--config-dir`, `--server-properties`, `--spigot-yml`, `--bukkit-yml`, `--paper-global-yml`, `--paper-world-yml` |
+| `check-config` | JVM flags + server config analysis with gamemode-aware safety checks | `--platform`, `--gamemode`, `--config-dir`, `--server-properties`, `--spigot-yml`, `--bukkit-yml`, `--paper-global-yml`, `--paper-world-yml`, `--canvas-config`, `--velocity-config`, `--purpur-config`, `--pufferfish-config` |
+| `pipeline` | Analyze netty pipeline handler chain and detect duplicate shaded handlers | `--thread` (default: `netty`), `--detect-duplicates` |
 
 ## Command Details
 
@@ -132,6 +133,14 @@ Generates a full analysis report with auto-generated findings. Includes platform
 ```bash
 python spark_toolkit.py report https://spark.lucko.me/abc123
 python spark_toolkit.py report https://spark.lucko.me/abc123 -o analysis.json
+```
+
+### pipeline
+Analyzes the Netty channel pipeline handler chain. By default targets threads whose name contains `netty`; pass `--thread` with a different substring (or multiple) to broaden. Use `--detect-duplicates` to flag duplicate shaded handlers (a common cause of duplicate compression/encryption and needless CPU).
+```bash
+python spark_toolkit.py pipeline https://spark.lucko.me/abc123
+python spark_toolkit.py pipeline https://spark.lucko.me/abc123 --thread netty --detect-duplicates
+python spark_toolkit.py pipeline https://spark.lucko.me/abc123 --thread "Netty Server" --thread "Netty Client"
 ```
 
 ## Targeting & Filtering Flags

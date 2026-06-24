@@ -76,6 +76,10 @@ All analysis goes through `scripts/spark_toolkit.py`. Every command outputs stru
 | `entities` | Entity/world statistics | Find dense entity hotspots |
 | `compare` | Compare two time windows | See performance changes over time |
 | `report` | Full analysis with findings | Generate complete report with auto-findings |
+| `analyze-gc` | Deep GC analysis (ZGC/G1GC) with tuning recommendations | Diagnose GC root cause; get flag suggestions |
+| `analyze-tps` | TPS/MSPT analysis with lag-spike detection | Investigate intermittent vs sustained lag |
+| `analyze-cpu` | CPU usage breakdown (process vs system) with thread attribution | Determine whether the bottleneck is CPU |
+| `recommend` | Prioritized performance recommendations | Get an action list ordered by impact |
 | `fetch` | Fetch raw profile data | Need raw protobuf/JSON data |
 | `health` | Full health report data | Need complete health data |
 
@@ -312,6 +316,34 @@ See `references/server-config-review.md` for the complete gamemode-specific conf
 
 ---
 
+### `references/optimization-guide-youhavetrouble.md` -- YouHaveTrouble's Minecraft Server Optimization Guide
+
+**What it is:** Community-maintained, version-tagged (MC 1.21.11) optimization guide from YouHaveTrouble/minecraft-optimization. Covers networking, chunks, mobs, misc settings, helpers, JVM flags, anti-pattern plugins, performance measurement, and a common-pitfalls companion doc. Per-option rationale with good starting values, including Purpur-specific knobs.
+
+**Why use it:** Complements Paper Chan's guide with finer-grained per-option reasoning (e.g. exact `despawn-ranges` math `(sim-dist * 16) + 8`, `treasure-maps` hang risk, `entity-per-chunk-save-limit` per-projectile table, Purpur's `villager.lobotomize`/`search-radius`/`use-alternate-keepalive`). Useful for cross-checking recommendations and catching version-specific gotchas:
+- **Networking** -- `network-compression-threshold` (incl. proxy/co-located disable recommendation), Purpur `use-alternate-keepalive` (TCPShield caveat)
+- **Chunks** -- `simulation-distance` vs `view-distance` interplay, `delay-chunk-unloads-by`, `prevent-moving-into-unloaded-chunks`, full `entity-per-chunk-save-limit` per-projectile table
+- **Mobs** -- bukkit `spawn-limits` + `ticks-per`, spigot `mob-spawn-range`/`entity-activation-range`/`entity-tracking-range`/`tick-inactive-villagers`/`nerf-spawner-mobs`, paper-world `despawn-ranges` (with the `(sim-dist*16)+8` hard-range formula), `per-player-mob-spawns`, `max-entity-collisions`, villager `tick-rates` (behavior + sensor), Purpur `zombie.aggressive-towards-villager-when-lagging`, `entities-can-use-portals`, `villager.lobotomize`, `villager.search-radius`
+- **Misc** -- `merge-radius`, `hopper-transfer`/`hopper-check`, `alt-item-despawn-rate` (full item list), `redstone-implementation: ALTERNATE_CURRENT`, `hopper.disable-move-event`/`ignore-occluding-blocks`, `optimize-explosions`, `treasure-maps.*`, grass/container-update/arrow despawn rates, Purpur `dolphin.disable-treasure-searching`, `teleport-if-outside-border`
+- **Helpers** -- `anti-xray.enabled`, `nether-ceiling-void-damage-height`
+- **JVM flags** -- Java 21+ requirement, Aikar's flags pointer (cross-ref `jvm-gc-tuning.md`/`jvm-flags-advanced.md`), `flags.sh` generator
+- **Anti-pattern plugins** -- ground-item removers, mob stackers, plugin enablers/disablers and the `/reload` problem
+- **Performance measurement** -- `/mspt` interpretation, Spark intro + lag-spike guide link
+- **Common pitfalls** -- backups, outdated software, why not Bukkit/Spigot, shared hosting caveats, command-function datapacks, CPU/I/O hardware guidance
+
+**When to look at it:**
+- When you need a second opinion or a version-specific cross-check against Paper Chan's recommendations
+- When the user is on **Purpur** and you need Purpur-only knobs (`villager.lobotomize`, `villager.search-radius`, `use-alternate-keepalive`, `entities-can-use-portals`, `zombie.aggressive-towards-villager-when-lagging`)
+- When you need the exact **`despawn-ranges` hard/soft** math or the **per-projectile `entity-per-chunk-save-limit`** starting table
+- When spark shows **treasure-map** or **dolphin structure-search** hangs -> recommend disabling `treasure-maps.enabled` / `dolphin.disable-treasure-searching`
+- When diagnosing **hopper** lag -> confirms `hopper-transfer`/`hopper-check` tradeoffs (and that `hopper-transfer: 1` is server-destroying; cross-ref `server-config-review.md`)
+- When recommending against **"too good to be true"** plugins (item clearers, mob stackers, runtime plugin toggles)
+- When advising on **networking/compression** thresholds, especially behind a proxy or on co-located hardware
+- When the user needs **hardware/hosting** reality checks (single-core CPU, avoid HDD, shared-hosting overselling)
+- When the user runs **vanilla/Fabric/Spigot** and needs `sync-chunk-writes: false` advice (noted in the guide's intro)
+
+---
+
 ### `references/cpu-analysis.md` -- CPU Usage Analysis
 
 **What it is:** Deep guide on interpreting CPU data from Spark profiler, understanding CPU saturation patterns, thread-level attribution, context switching, and the correlation between CPU and TPS/MSPT.
@@ -456,13 +488,15 @@ See `references/server-config-review.md` for the complete gamemode-specific conf
 **Why use it:** The `jvm-gc-tuning.md` reference covers GC flags, but Minecraft servers use many more JVM flags for optimization. This reference covers every flag you'll encounter in production startup scripts:
 
 - **GC Flags** -- G1GC, ZGC, and common GC tuning (see also: `jvm-gc-tuning.md`)
-- **Memory & Heap Flags** -- Xms/Xmx, AlwaysPreTouch, TransparentHugePages, CompactObjectHeaders, SoftRefLRUPolicyMSPerMB, AutoBoxCacheMax
-- **JIT Compiler Flags** -- CICompilerCount, MaxInlineLevel, MaxInlineSize, FreqInlineSize, InlineSmallCode, LoopUnrollLimit, UseSuperWord, UseVectorMacroLogic, SegmentedCodeCache, ReservedCodeCacheSize, NonProfiledCodeHeapSize, ProfiledCodeHeapSize, DontCompileHugeMethods, UseCriticalCompilerThreadPriority, UseCriticalJavaThreadPriority, UseFMA, UseCMoveUnconditionally, AlwaysActAsServerClassMachine
-- **CPU & Thread Flags** -- ActiveProcessorCount (MUST match actual cores), UseAVX (AVX=3 WARNING: requires AVX-512 CPU support)
-- **System Properties** -- log4j2.formatMsgNoLookups (Log4Shell mitigation), file.encoding, java.security.egd, user.timezone, net.kyori.ansi.colorLevel, terminal.jline, terminal.ansi, add-modules=jdk.incubator.vector (required for Canvas/Folia)
+- **Memory & Heap Flags** -- Xms/Xmx, AlwaysPreTouch, TransparentHugePages, CompactObjectHeaders, SoftRefLRUPolicyMSPerMB, AutoBoxCacheMax, **UseLargePages + LargePageSizeInBytes** (with a dedicated Large Pages section covering Linux huge-page reservation, Windows setup, troubleshooting, and LargePages vs TransparentHugePages trade-offs)
+- **JIT Compiler Flags** -- CICompilerCount, MaxInlineLevel, MaxInlineSize, FreqInlineSize, InlineSmallCode, LoopUnrollLimit, UseSuperWord, UseVectorMacroLogic, SegmentedCodeCache, ReservedCodeCacheSize, NonProfiledCodeHeapSize, ProfiledCodeHeapSize, DontCompileHugeMethods, UseCriticalCompilerThreadPriority, UseCriticalJavaThreadPriority, UseFMA, UseCMoveUnconditionally, **UseVectorCmov** (vectorized CMOV, distinct from scalar UseCMoveUnconditionally), AlwaysActAsServerClassMachine
+- **CPU & Thread Flags** -- ActiveProcessorCount (MUST match actual cores), UseAVX (AVX=3 WARNING: requires AVX-512 CPU support), **UseDynamicNumberOfGCThreads** (default for ZGC since JDK 17)
+- **System Properties** -- log4j2.formatMsgNoLookups (Log4Shell mitigation), file.encoding, java.security.egd, user.timezone, net.kyori.ansi.colorLevel, terminal.jline, terminal.ansi, add-modules=jdk.incubator.vector (required for Canvas/Folia), **PerfDisableSharedMem** (security + jstat/jcmd implications)
+- **GC Logging** -- dedicated **`-Xlog:gc*`** section covering tag selection, decorators, rotation (`filecount`/`filesize`), recommended production string (`-Xlog:gc*:GClogs/gc.log:time,uptime:filecount=10,filesize=50M`), verbose variants, and what each log line type diagnoses (pause, allocation stall, evacuation failure, leak)
+- **Sculptor system properties** -- `-Dsculptor.minecraftVersion`, `-Dsculptor.includeExperimental`, `-Ddump` documented as launcher-specific (Paper version scheme `26.1.2`), not JVM/Paper flags; safe no-ops elsewhere
 - **Canvas/Folia-specific** -- required modules, recommended thread pools, region thread sizing
 - **Bad Flags to Avoid** -- ParallelGC, CMS, AggressiveOpts, mismatched Xms/Xmx, and more
-- **JVM Flag Assessment Template** -- ready-to-use checklist for auditing startup scripts
+- **JVM Flag Assessment Template** -- ready-to-use checklist for auditing startup scripts (now includes LargePages, UseDynamicNumberOfGCThreads, PerfDisableSharedMem, Xlog, UseVectorCmov, CompactObjectHeaders, Sculptor props, add-modules lines)
 
 **When to look at it:**
 - When `check-config` reports JVM flag findings and you need to understand what each flag does
@@ -471,6 +505,9 @@ See `references/server-config-review.md` for the complete gamemode-specific conf
 - When you see Canvas/Folia startup scripts with `--add-modules=jdk.incubator.vector`
 - When evaluating whether a specific JVM flag is safe, recommended, or dangerous
 - When comparing the user's current flags against recommended values
+- When the script uses **large pages** (`-XX:+UseLargePages`/`LargePageSizeInBytes`) -- check the OS reservation steps before recommending
+- When the script uses **`-Xlog:gc*`** and you need to interpret GC log output or validate the rotation settings
+- When the script carries **`-Dsculptor.*`** properties (Sculptor fork) and you need to explain them or distinguish them from JVM/Paper flags
 
 ---
 
@@ -558,11 +595,11 @@ See `references/server-config-review.md` for the complete gamemode-specific conf
 **Why use it:** After spark analysis identifies *what* is causing lag, you need to recommend config changes, but those changes depend entirely on the server's gamemode. A setting that's perfectly fine for a lobby is game-breaking for SMP. This reference prevents you from making recommendations that damage gameplay:
 
 - **Gamemode-specific configuration profiles** -- SMP (preserve vanilla), Lobby (aggressive optimization OK), Bedwars/Skywars (combat mechanics matter), Skyblock (farms and hoppers are critical), Factions/PvP (visibility and combat fairness), Creative (maximize view distance, minimize entities), Modded (research mod requirements first)
-- **Bug-config warnings** -- 10 specific configs that improve performance numbers but introduce bugs: hopper-transfer=1 (server-destroying), max-entity-collisions<3 (game-breaking), simulation-distance<4 (farms broken), excessive merge-radius (items teleport), tick-inactive-villagers:false (iron farms broken), and more
+- **Bug-config warnings** -- 10 specific configs that improve performance numbers but introduce bugs: hopper-transfer=1 (server-destroying lag + broken sorters), max-entity-collisions<3 (minecarts/boats break), storage tick desync (hopper+chest timing), simulation-distance<4 (farms/simulation broken), excessive merge-radius (items teleport through walls), despawn-ranges too low (mobs vanish unexpectedly), tick-inactive-villagers:false (iron farms & trade restocks broken), nerf-spawner-mobs:true (spawner-farm output drops), aggressive entity-per-chunk-save-limit (legitimate farms crash), doDaylightCycle:false on SMP (gameplay desync)
 - **Absolute never-change rules** -- hopper-transfer must be 8, max-entity-collisions >= 3, simulation-distance >= 4 for gameplay worlds, mob-spawn-range <= sim-dist-1 AND >= 3
 - **Conditional never-change rules** -- gamemode-dependent settings that should NOT be changed (don't disable doMobSpawning on SMP, don't lower entity-tracking-range.players on PvP, etc.)
 - **Config dependency matrix** -- which configs MUST be changed together (spawn-limits + mob-spawn-range, simulation-distance + despawn-ranges, activation-range + tracking-range)
-- **Risk labels** -- [SAFE], [LOW RISK], [MODERATE RISK], [HIGH RISK], [BRAKE WARNING], [NEVER], [DEPENDS]
+- **Risk labels** -- [SAFE], [LOW RISK], [MODERATE RISK], [HIGH RISK], [BRAKE WARNING] (a "brake-config": improves a perf number but introduces a bug/desync -- apply the brakes before using), [NEVER], [DEPENDS]
 - **Systematic review checklist** -- 12-point checklist template covering view/sim distance, entity ranges, spawn limits, merge radius, despawn ranges, hopper settings, entity limits, gamerules, JVM flags, per-world configs, bug-config check, and dependency validation
 - **Quick-reference gamemode decision matrix** -- every major config value for every gamemode type at a glance
 
@@ -574,11 +611,6 @@ See `references/server-config-review.md` for the complete gamemode-specific conf
 - When the user shares their config files for review
 - When the user reports bugs after config changes (items disappearing, mobs not spawning, farms broken)
 - When you see a dangerous config like `hopper-transfer: 1` or `max-entity-collisions: 2` in a user's config
-
----
-
-### `references/cpu-analysis.md`
-See detailed entry above. (Duplicate reference path -- content is identical.)
 
 ---
 

@@ -27,10 +27,12 @@ The most reliable indicator of lag spikes is the gap between median MSPT and max
 | Percentile | Healthy | Warning | Critical |
 |-----------|---------|---------|----------|
 | P50 (median) | < 30ms | 30-45ms | > 45ms |
-| P90 | < 40ms | 40-60ms | > 60ms |
-| P95 | < 50ms | 50-80ms | > 80ms |
+| P90 | < 40ms | 40-45ms | > 45ms |
+| P95 | < 45ms | 45ms | > 45ms |
 | P99 | < 80ms | 80-150ms | > 150ms |
-| Max | < 100ms | 100-200ms | > 200ms |
+| Max | < 50ms | 50-150ms | > 150ms |
+
+> **Authority note:** The toolkit's runtime status labels (median/p95/max GOOD/WARNING/CRITICAL) use a uniform `<=30 GOOD / <=45 WARNING / >45 CRITICAL` boundary in `assess_mspt()`. The P90/P99 columns above are interpretive ranges not emitted by the toolkit -- treat P90/P99 the same as their parent percentile class when reading `tps` output (the toolkit reports P95 and Max statuses directly). For diagnostic interpretation (vs. simple labelling), P90 40-45ms / P95 ~45ms signal emerging spikes even when median is healthy.
 
 **Key insight**: If P50 is good but P99 is bad, you have intermittent spikes. If P50 is bad, you have sustained overload. These require different fixes.
 
@@ -124,7 +126,7 @@ If TPS drops independently of entity count:
 | Build Type | Cost | How to Spot | Fix |
 |-----------|------|------------|-----|
 | Clock circuit | Low per tick, sustained | Consistent MSPT at specific chunks | Limit clock speed, use observer-based designs |
-| Large piston array | Medium-High | MSPT spikes when pistons fire | Reduce simultanous pistons |
+| Large piston array | Medium-High | MSPT spikes when pistons fire | Reduce simultaneous pistons |
 | Comparator chain | Medium | Spark shows BlockData, Redstone | Use alternative logic |
 | TNT cannon | Very High (burst) | Extreme MSPT spike, many entity spawns | Limit TNT per activation |
 

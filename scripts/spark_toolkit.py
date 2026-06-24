@@ -54,6 +54,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
+import warnings
 from collections import defaultdict
 from pathlib import Path
 
@@ -450,13 +451,19 @@ def parse_protobuf_file(path):
     with open(path, "rb") as f:
         data_bytes = f.read()
 
+    last_error = None
     for parser in [parse_protobuf_sampler, parse_protobuf_heap, parse_protobuf_health]:
         try:
             result = parser(data_bytes)
             if result:
                 return result
-        except Exception:
+        except Exception as e:
+            last_error = e
             continue
+    if last_error is not None:
+        # Surface the real parse failure instead of a generic "install protobuf" hint,
+        # which is misleading when protobuf IS installed but the data is corrupt/mismatched.
+        warnings.warn(f"parse_protobuf_file: all parsers failed for {path}; last error: {type(last_error).__name__}: {last_error}")
     return None
 
 
@@ -498,8 +505,8 @@ def fetch_raw(profile_id):
 def open_file(path):
     p = str(path).lower()
     if p.endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8")
-    return open(path, "r", encoding="utf-8")
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "r", encoding="utf-8", errors="replace")
 
 
 def _is_likely_protobuf(file_path):
@@ -586,12 +593,14 @@ def load_data(source):
         pid = extract_id(source)
         try:
             return fetch_json(pid, full=True), "json_url"
-        except Exception:
+        except Exception as e:
+            print(f"spark_toolkit: fetch failed for {source}: {type(e).__name__}: {e}", file=sys.stderr)
             return None, None
     if re.match(r'^[a-zA-Z0-9]{4,20}$', source):
         try:
             return fetch_json(source, full=True), "json_url"
-        except Exception:
+        except Exception as e:
+            print(f"spark_toolkit: fetch failed for profile {source}: {type(e).__name__}: {e}", file=sys.stderr)
             return None, None
     if os.path.isfile(source):
         with open(source, "rb") as f:
@@ -604,12 +613,16 @@ def load_data(source):
             if proto_result:
                 return proto_result, "file_protobuf"
             if is_protobuf or is_sparkprofile:
-                return {"error": "Failed to parse protobuf file. Ensure 'protobuf' package is installed: pip install protobuf", "file": source}, "file_protobuf_error"
+                if _ensure_proto():
+                    msg = "Failed to parse protobuf file. The 'protobuf' package is installed, but all parsers (sampler/heap/health) rejected the data -- the file may be corrupt or use an incompatible schema version."
+                else:
+                    msg = "Failed to parse protobuf file. The 'protobuf' package is not installed: pip install protobuf"
+                return {"error": msg, "file": source}, "file_protobuf_error"
         if p.endswith(".gz"):
-            with gzip.open(source, "rt", encoding="utf-8") as f:
+            with gzip.open(source, "rt", encoding="utf-8", errors="replace") as f:
                 content = f.read()
         else:
-            with open(source, "r", encoding="utf-8") as f:
+            with open(source, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
         try:
             data = json.loads(content)

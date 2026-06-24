@@ -20,11 +20,20 @@ Concrete thresholds for evaluating Minecraft server health from Spark profiler d
 
 ## MSPT (Milliseconds Per Tick)
 
-| Rating | MSPT | P95 Threshold | Max Threshold | Description |
+| Rating | MSPT (median) | P95 | Max | Description |
 |--------|------|--------------|---------------|-------------|
-| GOOD | < 30ms | < 40ms | < 50ms | Server comfortably within 50ms budget. Good headroom. |
-| WARNING | 30-45ms | 40-80ms | 50-150ms | Server using most of tick budget. Occasional delays. |
-| CRITICAL | > 45ms | > 80ms | > 150ms | Server cannot keep up. Sustained lag, missed ticks. |
+| GOOD | <= 30ms | <= 30ms | <= 30ms | Server comfortably within 50ms budget. Good headroom. |
+| WARNING | 30-45ms | 30-45ms | 30-45ms | Server using most of tick budget. Occasional delays. |
+| CRITICAL | > 45ms | > 45ms | > 45ms | Server cannot keep up. Sustained lag, missed ticks. |
+
+> **Authority note:** The toolkit applies a single `assess_mspt()` boundary (`<=30 GOOD / <=45 WARNING / >45 CRITICAL`) to median, P95, AND max uniformly -- see `spark_toolkit.py:712` and `spark_toolkit_output.md`. The table above matches the runtime. For *diagnostic interpretation* (separate from the label the toolkit prints), use these supplementary ranges:
+>
+> | Diagnostic view | Healthy | Watch | Act |
+> |---|---|---|---|
+> | Median (P50) | < 30ms | 30-45ms | > 45ms |
+> | P95 (consistency) | < 45ms | 45ms | > 45ms (every spike above this is a missed tick) |
+> | Max (worst tick) | < 50ms | 50-150ms (4+ missed ticks) | > 150ms (severe stall) |
+> | Spike gap (Max ÷ Median) | < 2x | 2-10x (intermittent) | > 10x (severe intermittent spikes) |
 
 **Explanation**: Each tick must complete within 50ms (1000ms / 20 TPS). MSPT of 50ms = exactly 20 TPS. MSPT of 100ms = 10 TPS.
 
@@ -109,11 +118,13 @@ Concrete thresholds for evaluating Minecraft server health from Spark profiler d
 
 | Rating | CPU Steal % | Description |
 |--------|------------|-------------|
-| GOOD | < 2% | Host has resources available |
-| WARNING | 2-10% | Host overcommitted, occasional steals |
-| CRITICAL | > 10% | Host severely overcommitted. Switch providers. |
+| GOOD | 0-2% | Normal virtualization overhead. Host has resources available. |
+| OK | 2-5% | Minor contention. Monitor during peak times. |
+| WARNING | 5-10% | Host overcommitted. Contact provider, consider upgrade. |
+| CRITICAL | 10-20% | Significant CPU time lost. Switch providers or get dedicated CPU. |
+| EMERGENCY | > 20% | Server severely impacted. Immediate action: change hosting. |
 
-CPU steal means the hypervisor is taking CPU time away from your VM for other tenants. This cannot be fixed by JVM tuning.
+> This 5-tier scale matches `references/cpu-analysis.md` (the detailed CPU reference). CPU steal means the hypervisor is taking CPU time away from your VM for other tenants. **This cannot be fixed by JVM tuning** -- the only fix is better hosting (dedicated CPU, less oversold node).
 
 ---
 

@@ -19,11 +19,13 @@ TPS and MSPT values are automatically assessed in the `tps` command:
 | Metric | GOOD | WARNING | CRITICAL |
 |---|---|---|---|
 | TPS | >= 19.5 | 15 - 19.5 | < 15 |
-| MSPT median | < 30ms | 30 - 45ms | > 45ms |
-| MSPT P95 | < 45ms | 45 - 60ms | > 60ms |
-| MSPT max | < 50ms | 50 - 150ms | > 150ms |
+| MSPT median | <= 30ms | 30 - 45ms | > 45ms |
+| MSPT P95 | <= 30ms | 30 - 45ms | > 45ms |
+| MSPT max | <= 30ms | 30 - 45ms | > 45ms |
 | GC frequency | < 1/min | 1 - 5/min | > 5/min |
 | GC avg pause | < 50ms | 50 - 200ms | > 200ms |
+
+> **Note:** The toolkit applies one `assess_mspt()` boundary (`<=30 GOOD / <=45 WARNING / >45 CRITICAL`) to median, P95, and Max identically (see `spark_toolkit.py:712`). This is intentionally coarse -- a single bad P95 or Max tick will flip the whole window to WARNING/CRITICAL. The *diagnostic interpretation* (when you want to know whether a high Max is a one-off spike or sustained overload) lives in `references/performance-standards.md` (MSPT table) and `references/lag-diagnosis.md` (percentile analysis + spike-gap ratios). Use those references when the label says CRITICAL but median is well under 30ms.
 
 ## Plugin-Heap Assessment Levels
 
