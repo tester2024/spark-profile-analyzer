@@ -1317,7 +1317,7 @@ def cmd_tps(args):
     pstats = get_platform_stats(meta)
 
     result = {}
-    if "tps" in pstats:
+    if pstats.get("tps"):
         t = pstats["tps"]
         result["tps"] = {
             "1m": {"value": t.get("last1m"), "status": assess_tps(t.get("last1m", 0))},
@@ -1326,7 +1326,7 @@ def cmd_tps(args):
             "target": t.get("gameTargetTps", t.get("game_target_tps", 20)),
         }
 
-    if "mspt" in pstats:
+    if pstats.get("mspt"):
         m = pstats["mspt"]
         for window_key in ["last1m", "last5m"]:
             w = m.get(window_key, {})
@@ -1751,7 +1751,7 @@ def cmd_report(args):
 
     findings = []
 
-    if pstats and "tps" in pstats:
+    if pstats and pstats.get("tps"):
         for period, key in [("1m", "last1m"), ("5m", "last5m"), ("15m", "last15m")]:
             val = pstats["tps"].get(key, 20)
             if val < 15:
@@ -1759,7 +1759,7 @@ def cmd_report(args):
             elif val < 19.5:
                 findings.append({"severity": "WARNING", "category": "tps", "detail": f"TPS {period}m is {val}, below ideal 20"})
 
-    if pstats and "mspt" in pstats:
+    if pstats and pstats.get("mspt"):
         for period, key in [("1m", "last1m"), ("5m", "last5m")]:
             w = pstats["mspt"].get(key, {})
             p95 = w.get("percentile95", 0)
